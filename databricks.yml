@@ -1,0 +1,43 @@
+# databricks.yml — Databricks Asset Bundle (DAB) root configuration
+# Compute: Serverless (no cluster to manage)
+
+# ONBOARD A NEW SILVER TABLE — no code or YAML changes needed:
+#   1. Add a row to config/bulk_transforms.csv
+#   2. Optionally create per-table data_quality.yml + data_governance.yml
+#   3. The next scheduled run picks it up automatically
+
+bundle:
+  name: silver-layer
+
+
+include:
+  - resources/*.yml
+
+variables:
+
+  run_mode:
+    description: "incremental | full_refresh. Applies to all tables in the run."
+    default: "incremental"
+
+  notification_email:
+    description: "Email address for pipeline failure alerts."
+    default: "praveen.ssyy@gmail.com"
+
+# TARGETS
+targets:
+
+  dev:
+    mode: development          
+    default: true
+    workspace:
+      host: https://dbc-4c300e18-38fe.cloud.databricks.com/
+
+  staging:
+    mode: development
+    workspace:
+      host: https://dbc-4c300e18-38fe.cloud.databricks.com/
+
+  prod:
+    mode: production           
+    workspace:
+      host: https://dbc-4c300e18-38fe.cloud.databricks.com/

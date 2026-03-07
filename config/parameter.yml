@@ -1,0 +1,24 @@
+name: silver
+
+#  Pipeline config table (silver_config.csv written here as Delta) 
+config_catalog: cdl_silver
+config_schema: config_schema
+config_table: silver_config_table
+
+#  Audit, logging, and watermark state (single `logging` schema for all)
+logging_catalog: cdl_silver
+logging_schema: logging
+audit_table: pipeline_run_log
+log_table: transformations_log
+job_logs_table: job_logs_silver
+watermark_table: watermark_state
+
+#  Data quality catalog / schema (DQX creates the tables when it runs) ─
+data_quality_catalog: cdl_silver
+data_quality_schema: data_quality
+data_quality_table: dq_log_silver
+dqx_rules_workspace_path: /Workspace/Users/praveen.yadav@aidetic.in/dqx_rules
+
+#  Governance catalog / schema ─
+governance_catalog: cdl_silver
+governance_schema: governance

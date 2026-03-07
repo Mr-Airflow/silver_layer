@@ -1,0 +1,177 @@
+# data_governance.yml — Unity Catalog Governance Configuration
+# Governance is applied via the Databricks Unity Catalog Python SDK
+# (databricks-sdk) and Spark SQL DDL — NOT raw SQL strings in Python code.
+
+# Table identity (catalog / schema / table) is derived automatically from
+# pipeline_config.yml via GovernanceEngine._resolve_full_table().
+
+
+governance:
+
+  #  Table Ownership 
+  table_owner:  "data_engineering_team"
+  data_steward: "praveen.ssyy@gmail.com"
+
+  #  Table-Level Tags 
+  # ABAC-compatible tag keys so they can drive centralised masking policies.
+  table_tags:
+    domain:              "retail_customers"
+    data_classification: "confidential"
+    owner_team:          "data_engineering"
+    pii_present:         "true"
+    sla_tier:            "tier1"
+    layer:               "silver"
+    source_system:       "bakehouse"
+    env:                 "prod"
+
+  #  PII Column Configuration
+  # For each PII column the governance engine will:
+  #   1. Tag the column  → ALTER TABLE ... ALTER COLUMN ... SET TAGS (...)
+  #   2. Create masking function → CREATE OR REPLACE FUNCTION ...
+  #   3. Attach mask     → ALTER TABLE ... ALTER COLUMN ... SET MASK ...
+  #
+  # Account admins (IS_ACCOUNT_ADMIN()) and members of the 'admins' group
+  # (IS_ACCOUNT_GROUP_MEMBER('admins')) always see unmasked values.
+  # All other users see masked values.
+
+  pii_columns:
+
+    - column: "first_name"
+      pii_type: "NAME"
+      sensitivity: "high"
+      abac_tag_key: "pii"
+      abac_tag_value: "name"
+      masking_function: "mask_first_name"
+      masking_sql: |
+        CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_first_name(name STRING)
+        RETURN CASE
+            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN name
+            ELSE CONCAT(LEFT(name, 1), '***')
+        END
+
+    - column: "last_name"
+      pii_type: "NAME"
+      sensitivity: "high"
+      abac_tag_key: "pii"
+      abac_tag_value: "name"
+      masking_function: "mask_last_name"
+      masking_sql: |
+        CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_last_name(name STRING)
+        RETURN CASE
+            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN name
+            ELSE CONCAT(LEFT(name, 1), '***')
+        END
+
+    - column: "full_name"
+      pii_type: "NAME"
+      sensitivity: "high"
+      abac_tag_key: "pii"
+      abac_tag_value: "name"
+      masking_function: "mask_full_name"
+      masking_sql: |
+        CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_full_name(name STRING)
+        RETURN CASE
+            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN name
+            ELSE SPLIT(name, ' ')[0] || ' ***'
+        END
+
+    - column: "email_address"
+      pii_type: "EMAIL"
+      sensitivity: "high"
+      abac_tag_key: "pii"
+      abac_tag_value: "email"
+      masking_function: "mask_email"
+      masking_sql: |
+        CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_email(email STRING)
+        RETURN CASE
+            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN email
+            ELSE SPLIT(email, '@')[0] || '@***.***'
+        END
+
+    - column: "phone_number"
+      pii_type: "PHONE"
+      sensitivity: "high"
+      abac_tag_key: "pii"
+      abac_tag_value: "phone"
+      masking_function: "mask_phone"
+      masking_sql: |
+        CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_phone(phone STRING)
+        RETURN CASE
+            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN phone
+            WHEN phone = 'UNKNOWN' THEN phone
+            ELSE CONCAT(REPEAT('*', GREATEST(LENGTH(REGEXP_REPLACE(phone, '[^0-9]', '')) - 4, 0)),
+                        RIGHT(REGEXP_REPLACE(phone, '[^0-9]', ''), 4))
+        END
+
+    - column: "address"
+      pii_type: "ADDRESS"
+      sensitivity: "high"
+      abac_tag_key: "pii"
+      abac_tag_value: "address"
+      masking_function: "mask_address"
+      masking_sql: |
+        CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_address(addr STRING)
+        RETURN CASE
+            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN addr
+            ELSE '*** REDACTED ***'
+        END
+
+  #  Non-PII Column Tags
+  column_tags:
+
+    - column: "customer_id"
+      tags:
+        sensitivity: "internal"
+        domain:      "retail_customers"
+        is_pk:       "true"
+
+    - column: "city"
+      tags:
+        sensitivity: "internal"
+        domain:      "retail_customers"
+
+    - column: "country"
+      tags:
+        sensitivity: "internal"
+        domain:      "retail_customers"
+
+    - column: "continent"
+      tags:
+        sensitivity: "internal"
+        domain:      "retail_customers"
+
+    - column: "_silver_loaded_at"
+      tags:
+        system_generated: "true"
+        layer:            "silver"
+
+  #  Table Access Grants 
+  grants:
+    - principal:   "data_analysts"
+      privileges:
+        - "SELECT"
+      principal_type: "group"
+
+    - principal:   "data_scientists"
+      privileges:
+        - "SELECT"
+      principal_type: "group"
+
+    - principal:   "data_engineering_team"
+      privileges:
+        - "SELECT"
+        - "MODIFY"
+      principal_type: "group"
+
+    - principal:   "reporting_users"
+      privileges:
+        - "SELECT"
+      principal_type: "group"
+
+  #  Row-Level Security 
+
+
+  #  Audit Trail 
+  audit:
+    enabled:     true
+    audit_table: "cdl_silver.logging.silver_audit_log"

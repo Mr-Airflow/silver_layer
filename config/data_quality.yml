@@ -1,0 +1,37 @@
+# data_quality.yml — Data Quality Rules (Databricks DQX Framework)
+
+#  HOW DQX WORKS 
+# DQX splits your DataFrame into:
+#   valid_df      → Rows that pass all "error" checks → written to Silver
+#   quarantine_df → Rows that fail at least one "error" check → excluded
+#
+# Criticality levels:
+#   error  → Row goes to quarantine ONLY (excluded from Silver write)
+#   warn   → Row goes to BOTH Silver and quarantine (flagged but not excluded)
+
+data_quality:
+
+  #  Output Tables 
+  quarantine_table:  "cdl_silver.data_quality.customers_quarantine"   
+  dq_results_table:  "cdl_silver.data_quality.dq_results_customers"   
+
+  # Pipeline Failure Threshold 
+  # If the percentage of quarantined (error) rows exceeds this threshold,
+  # the pipeline raises an exception and halts before writing to Silver.
+  
+  failure_threshold_pct: 5.0
+
+  checks:
+
+    # COMPLETENESS CHECKS — required fields must not be null/empty
+
+    - name: "customer_id_not_null"
+      criticality: "error"
+      user_metadata:
+        check_category: "completeness"
+        check_owner: "praveen.ssyy@gmail.com"
+      check:
+        function: is_not_null
+        arguments:
+          column: customer_id
+
