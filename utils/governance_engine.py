@@ -124,9 +124,11 @@ class GovernanceEngine:
                 logger.warning("Column tag failed on '%s': %s", col, exc)
 
     def _ensure_governance_schema(self) -> None:
-        """Create governance catalog and schema if they don't exist."""
+        """Verify governance catalog exists and create schema if it doesn't."""
         try:
-            self.spark.sql(f"CREATE CATALOG IF NOT EXISTS `{self.catalog}`")
+            existing = {r[0].lower() for r in self.spark.sql("SHOW CATALOGS").collect()}
+            if self.catalog.lower() not in existing:
+                raise RuntimeError(f"Catalog `{self.catalog}` does not exist. Please create it first.")
             self.spark.sql(
                 f"CREATE SCHEMA IF NOT EXISTS `{self.catalog}`.`governance`"
             )

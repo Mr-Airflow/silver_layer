@@ -10,7 +10,7 @@ governance:
 
   #  Table Ownership 
   table_owner:  "data_engineering_team"
-  data_steward: "praveen.ssyy@gmail.com"
+  data_steward: "praveen.yadav@aidetic.in"
 
   #  Table-Level Tags 
   # ABAC-compatible tag keys so they can drive centralised masking policies.

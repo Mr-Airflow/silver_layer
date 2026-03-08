@@ -1,0 +1,22 @@
+# dq/sales_suppliers_001.yml — Data Quality Rules for Silver Suppliers
+
+data_quality:
+
+  quarantine_table:      "cdl_silver.data_quality.suppliers_quarantine"
+  dq_results_table:      "cdl_silver.data_quality.dq_results_suppliers"
+  failure_threshold_pct: 5.0
+
+  checks:
+
+    # COMPLETENESS
+
+    - name: "supplier_id_not_null"
+      criticality: "error"
+      user_metadata:
+        check_category: "completeness"
+        check_owner: "praveen.yadav@aidetic.in"
+      check:
+        function: is_not_null
+        arguments:
+          column: supplierID
+

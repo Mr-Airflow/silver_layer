@@ -109,10 +109,12 @@ class DQEngine:
         return valid_df, quarantine_df, summary
 
     def _ensure_location(self, full_table: str) -> None:
-        """Create catalog and schema for a 3-part table name if they don't exist."""
+        """Verify catalog exists and create schema for a 3-part table name if it doesn't."""
         parts = [p.strip().strip("`") for p in full_table.split(".")]
         if len(parts) >= 1 and parts[0]:
-            self.spark.sql(f"CREATE CATALOG IF NOT EXISTS `{parts[0]}`")
+            existing = {r[0].lower() for r in self.spark.sql("SHOW CATALOGS").collect()}
+            if parts[0].lower() not in existing:
+                raise RuntimeError(f"Catalog `{parts[0]}` does not exist. Please create it first.")
         if len(parts) >= 2 and parts[1]:
             self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{parts[0]}`.`{parts[1]}`")
 

@@ -112,7 +112,9 @@ class PipelineLogger:
         """Create the audit table in Unity Catalog if it does not exist."""
         cat, sch, _ = _parse_3part(audit_table)
         if cat:
-            self.spark.sql(f"CREATE CATALOG IF NOT EXISTS `{cat}`")
+            existing = {r[0].lower() for r in self.spark.sql("SHOW CATALOGS").collect()}
+            if cat.lower() not in existing:
+                raise RuntimeError(f"Catalog `{cat}` does not exist. Please create it first.")
         if cat and sch:
             self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{cat}`.`{sch}`")
         self.spark.sql(
@@ -178,7 +180,9 @@ class PipelineLogger:
         """Create the migration log table in Unity Catalog if it does not exist."""
         cat, sch, _ = _parse_3part(log_table)
         if cat:
-            self.spark.sql(f"CREATE CATALOG IF NOT EXISTS `{cat}`")
+            existing = {r[0].lower() for r in self.spark.sql("SHOW CATALOGS").collect()}
+            if cat.lower() not in existing:
+                raise RuntimeError(f"Catalog `{cat}` does not exist. Please create it first.")
         if cat and sch:
             self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{cat}`.`{sch}`")
         self.spark.sql(
