@@ -8,11 +8,12 @@
 
 governance:
 
-  #  Table Ownership 
-  table_owner:  "data_engineering_team"
-  data_steward: "praveenfaa@gmail.com"
+  #  Table Ownership
+  # Owner is the admin user. Unity Catalog requires an existing user email or group.
+  table_owner:  "praveen.yadav@aidetic.in"
+  data_steward: "praveen.yadav@aidetic.in"
 
-  #  Table-Level Tags 
+  #  Table-Level Tags
   # ABAC-compatible tag keys so they can drive centralised masking policies.
   table_tags:
     domain:              "retail_customers"
@@ -30,9 +31,9 @@ governance:
   #   2. Create masking function → CREATE OR REPLACE FUNCTION ...
   #   3. Attach mask     → ALTER TABLE ... ALTER COLUMN ... SET MASK ...
   #
-  # Account admins (IS_ACCOUNT_ADMIN()) and members of the 'admins' group
-  # (IS_ACCOUNT_GROUP_MEMBER('admins')) always see unmasked values.
-  # All other users see masked values.
+  # IMPORTANT: IS_ACCOUNT_ADMIN() is NOT supported in Unity Catalog masking functions.
+  # Instead we use current_user() to allow the admin (praveen.yadav@aidetic.in)
+  # to see unmasked values. All other users (e.g. aayushmahajan@aidetic.in) see masked values.
 
   pii_columns:
 
@@ -45,7 +46,7 @@ governance:
       masking_sql: |
         CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_first_name(name STRING)
         RETURN CASE
-            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN name
+            WHEN current_user() = 'praveen.yadav@aidetic.in' THEN name
             ELSE CONCAT(LEFT(name, 1), '***')
         END
 
@@ -58,7 +59,7 @@ governance:
       masking_sql: |
         CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_last_name(name STRING)
         RETURN CASE
-            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN name
+            WHEN current_user() = 'praveen.yadav@aidetic.in' THEN name
             ELSE CONCAT(LEFT(name, 1), '***')
         END
 
@@ -71,7 +72,7 @@ governance:
       masking_sql: |
         CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_full_name(name STRING)
         RETURN CASE
-            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN name
+            WHEN current_user() = 'praveen.yadav@aidetic.in' THEN name
             ELSE SPLIT(name, ' ')[0] || ' ***'
         END
 
@@ -84,7 +85,7 @@ governance:
       masking_sql: |
         CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_email(email STRING)
         RETURN CASE
-            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN email
+            WHEN current_user() = 'praveen.yadav@aidetic.in' THEN email
             ELSE SPLIT(email, '@')[0] || '@***.***'
         END
 
@@ -97,7 +98,7 @@ governance:
       masking_sql: |
         CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_phone(phone STRING)
         RETURN CASE
-            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN phone
+            WHEN current_user() = 'praveen.yadav@aidetic.in' THEN phone
             WHEN phone = 'UNKNOWN' THEN phone
             ELSE CONCAT(REPEAT('*', GREATEST(LENGTH(REGEXP_REPLACE(phone, '[^0-9]', '')) - 4, 0)),
                         RIGHT(REGEXP_REPLACE(phone, '[^0-9]', ''), 4))
@@ -112,7 +113,7 @@ governance:
       masking_sql: |
         CREATE OR REPLACE FUNCTION cdl_silver.governance.mask_address(addr STRING)
         RETURN CASE
-            WHEN IS_ACCOUNT_ADMIN() OR IS_ACCOUNT_GROUP_MEMBER('admins') THEN addr
+            WHEN current_user() = 'praveen.yadav@aidetic.in' THEN addr
             ELSE '*** REDACTED ***'
         END
 
@@ -145,33 +146,19 @@ governance:
         system_generated: "true"
         layer:            "silver"
 
-  #  Table Access Grants 
+  #  Table Access Grants
   grants:
-    - principal:   "data_analysts"
+    - principal:   "praveen.yadav@aidetic.in"
+      privileges:
+        - "ALL_PRIVILEGES"
+      principal_type: "user"
+
+    - principal:   "aayushmahajan@aidetic.in"
       privileges:
         - "SELECT"
-      principal_type: "group"
+      principal_type: "user"
 
-    - principal:   "data_scientists"
-      privileges:
-        - "SELECT"
-      principal_type: "group"
-
-    - principal:   "data_engineering_team"
-      privileges:
-        - "SELECT"
-        - "MODIFY"
-      principal_type: "group"
-
-    - principal:   "reporting_users"
-      privileges:
-        - "SELECT"
-      principal_type: "group"
-
-  #  Row-Level Security 
-
-
-  #  Audit Trail 
+  #  Audit Trail
   audit:
     enabled:     true
     audit_table: "cdl_silver.logging.silver_audit_log"

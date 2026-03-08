@@ -17,7 +17,7 @@ data_quality:
       criticality: "error"
       user_metadata:
         check_category: "completeness"
-        check_owner: "praveenfaa@gmail.com"
+        check_owner: "praveen.yadav@aidetic.in"
       check:
         function: is_not_null
         arguments:

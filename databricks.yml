@@ -21,7 +21,7 @@ variables:
 
   notification_email:
     description: "Email address for pipeline failure alerts."
-    default: "praveenfaa@gmail.com"
+    default: "praveen.yadav@aidetic.in"
 
 # TARGETS
 targets:
@@ -30,14 +30,14 @@ targets:
     mode: development          
     default: true
     workspace:
-      host: https://dbc-4c300e18-38fe.cloud.databricks.com/
+      host: https://adb-7405618144348512.12.azuredatabricks.net/
 
   staging:
     mode: development
     workspace:
-      host: https://dbc-4c300e18-38fe.cloud.databricks.com/
+      host: https://adb-7405618144348512.12.azuredatabricks.net/
 
   prod:
     mode: production           
     workspace:
-      host: https://dbc-4c300e18-38fe.cloud.databricks.com/
+      host: https://adb-7405618144348512.12.azuredatabricks.net/

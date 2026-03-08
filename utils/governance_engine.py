@@ -214,7 +214,7 @@ class GovernanceEngine:
             return
         try:
             self._wc.grants.update(
-                securable_type=SecurableType.TABLE,
+                securable_type=SecurableType.TABLE.value.lower(),
                 full_name=self.full_name,
                 changes=changes,
             )

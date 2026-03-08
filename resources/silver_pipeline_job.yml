@@ -123,6 +123,7 @@ resources:
           description: "OPTIMIZE + ZORDER + VACUUM for tables with run_optimize=true"
           depends_on:
             - task_key: transform
+            - task_key: data_quality
           environment_key: silver_env
           notebook_task:
             notebook_path: ${workspace.file_path}/notebooks/stages/05_optimize

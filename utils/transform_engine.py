@@ -303,7 +303,7 @@ class BulkTransformEngine:
             print(f"[AUDIT]  Marked processed=true in {self.config_table} for: {target}")
         except Exception as exc:
             logger.error("[BulkTransform] Failed to mark processed: %s", exc, exc_info=True)
-            print(f"[AUDIT] ✗ Could not update processed: {exc}")
+            print(f"[AUDIT]  Could not update processed: {exc}")
 
     def run_all(
         self,
@@ -410,7 +410,7 @@ class BulkTransformEngine:
                     msg = f"[{tid}] Cannot access '{full_source}': {e}"
                     issues.append(msg)
                     source_ok = False
-                    print(f"[VALIDATE] ✗ {msg}")
+                    print(f"[VALIDATE]  {msg}")
             else:
                 print(f"[VALIDATE] ○ [{tid}] No source_table — SQL references tables directly")
 
@@ -465,7 +465,7 @@ class BulkTransformEngine:
                 result = BulkTransformResult(
                     transform_id=tid, status="FAILED", error_message=str(exc)
                 )
-                print(f"  ✗ {tid} — FAILED: {str(exc)[:200]}")
+                print(f"   {tid} — FAILED: {str(exc)[:200]}")
                 if stop_on_error:
                     results.append(result)
                     raise
@@ -594,7 +594,7 @@ class BulkTransformEngine:
 
             except Exception as e:
                 logger.error("[DQ] [%s] Failed: %s", tid, e, exc_info=True)
-                print(f"[DQ] [{tid}] ✗ Failed: {e}")
+                print(f"[DQ] [{tid}]  Failed: {e}")
                 try:
                     self._update_control(tid, "FAILED", rows_loaded, str(e)[:2000], source_count)
                     self._write_migration_log(
@@ -632,7 +632,7 @@ class BulkTransformEngine:
                 print(f"[GOVERNANCE] [{t['id']}]  Governance applied")
             except Exception as e:
                 logger.error("[GOVERNANCE] [%s] Failed: %s", t["id"], e, exc_info=True)
-                print(f"[GOVERNANCE] [{t['id']}] ✗ Failed: {e}")
+                print(f"[GOVERNANCE] [{t['id']}]  Failed: {e}")
 
         print(f"\n[GOVERNANCE]  Complete — {applied} table(s) processed")
         return applied
@@ -696,7 +696,7 @@ class BulkTransformEngine:
                 )
             except Exception as e:
                 logger.error("[AUDIT] [%s] Failed: %s", tid, e, exc_info=True)
-                print(f"[AUDIT] [{tid}] ✗ Failed: {e}")
+                print(f"[AUDIT] [{tid}]  Failed: {e}")
 
         print(f"\n[AUDIT]  Complete — {written} audit record(s) written")
 
@@ -725,7 +725,7 @@ class BulkTransformEngine:
                 print(f"[OPTIMIZE] [{t['id']}]  Optimized {full_target}")
             except Exception as e:
                 logger.error("[OPTIMIZE] [%s] Failed: %s", t["id"], e, exc_info=True)
-                print(f"[OPTIMIZE] [{t['id']}] ✗ Failed: {e}")
+                print(f"[OPTIMIZE] [{t['id']}]  Failed: {e}")
 
         print(f"\n[OPTIMIZE]  Complete — {applied} table(s) optimized")
         return applied
@@ -1360,7 +1360,7 @@ class BulkTransformEngine:
             elif r.status == "SKIPPED":
                 mark = "-"
             else:
-                mark = "✗"
+                mark = ""
             print(f"  {mark} {r.id:<29} {r.status:<12} {r.rows_loaded:>10,} {r.duration_seconds:>7.1f}s")
             if r.error_message and r.status not in ("SKIPPED",):
                 msg = r.error_message[:120] + ("…" if len(r.error_message) > 120 else "")

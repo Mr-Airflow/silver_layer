@@ -2,8 +2,9 @@
 
 governance:
 
-  table_owner:  "data_engineering_team"
-  data_steward: "praveenfaa@gmail.com"
+  # Owner is the admin user directly (no group required).
+  table_owner:  "praveen.yadav@aidetic.in"
+  data_steward: "praveen.yadav@aidetic.in"
 
   table_tags:
     domain:              "retail_franchises"
@@ -14,6 +15,18 @@ governance:
     layer:               "silver"
     source_system:       "bakehouse"
     env:                 "prod"
+
+  #  Table Access Grants
+  grants:
+    - principal:   "praveen.yadav@aidetic.in"
+      privileges:
+        - "ALL_PRIVILEGES"
+      principal_type: "user"
+
+    - principal:   "aayushmahajan@aidetic.in"
+      privileges:
+        - "SELECT"
+      principal_type: "user"
 
 audit:
   enabled: true
