@@ -119,10 +119,10 @@ class BulkTransformEngine:
     Bronze read → incremental filter → SQL → Silver write
     → DQ → Governance → Optimize → Audit → watermark update.
 
-    Stage flags (per CSV row, yes/no, default shown):
-      run_data_quality  no   opt-in  (needs dq_config_path)
-      run_governance    no   opt-in  (needs governance_config_path)
-      run_optimize      no   opt-in
+    Stage flags (per CSV row, true/false, default shown):
+      run_data_quality  false  opt-in  (needs dq_config_path)
+      run_governance    false  opt-in  (needs governance_config_path)
+      run_optimize      false  opt-in
 
     Audit always runs for every row (no flag needed).
     The pk column is pipe-separated for composite keys: customer_id|order_id
@@ -214,7 +214,7 @@ class BulkTransformEngine:
                     continue
 
                 for flag in ("run_data_quality", "run_governance", "run_optimize"):
-                    row[flag] = row.get(flag, "").lower() == "yes"
+                    row[flag] = row.get(flag, "").lower() == "true"
 
                 row["pk"] = _split_pipe(row.get("pk", ""))
 
@@ -262,7 +262,7 @@ class BulkTransformEngine:
                 continue
 
             for flag in ("run_data_quality", "run_governance", "run_optimize"):
-                row[flag] = str(row.get(flag, "")).lower() == "yes"
+                row[flag] = str(row.get(flag, "")).lower() == "true"
 
             row["pk"] = _split_pipe(str(row.get("pk", "")))
 
@@ -279,7 +279,7 @@ class BulkTransformEngine:
 
     def mark_processed(self, filter_ids: Optional[List[str]] = None) -> None:
         """
-        Set processed = 'yes' in the config Delta table for all rows in this run.
+        Set processed = 'true' in the config Delta table for all rows in this run.
         If filter_ids is provided, only those IDs are updated; otherwise all rows.
         """
         if not self.config_table:
@@ -296,11 +296,11 @@ class BulkTransformEngine:
 
         try:
             self.spark.sql(
-                f"UPDATE {self.config_table} SET processed = 'yes' WHERE {where_clause}"
+                f"UPDATE {self.config_table} SET processed = 'true' WHERE {where_clause}"
             )
             target = ", ".join(filter_ids) if filter_ids else "all rows"
-            logger.info("[BulkTransform] Marked processed=yes for: %s", target)
-            print(f"[AUDIT]  Marked processed=yes in {self.config_table} for: {target}")
+            logger.info("[BulkTransform] Marked processed=true for: %s", target)
+            print(f"[AUDIT]  Marked processed=true in {self.config_table} for: {target}")
         except Exception as exc:
             logger.error("[BulkTransform] Failed to mark processed: %s", exc, exc_info=True)
             print(f"[AUDIT] ✗ Could not update processed: {exc}")
@@ -321,7 +321,7 @@ class BulkTransformEngine:
           2. run_governance_all  — Unity Catalog tags, masking, grants
           3. run_optimize_all    — OPTIMIZE
           4. run_audit_all       — write audit records
-          5. mark_processed      — set processed=yes in config table
+          5. mark_processed      — set processed=true in config table
         """
         run_id = str(uuid.uuid4())
         logger.info("=" * 65)
@@ -332,6 +332,7 @@ class BulkTransformEngine:
         results = self.transform_all(
             filter_ids=filter_ids, stop_on_error=stop_on_error, run_id=run_id
         )
+        self.run_dq_all(filter_ids=filter_ids, run_id=run_id)
         self.run_governance_all(filter_ids=filter_ids)
         self.run_optimize_all(filter_ids=filter_ids)
         self.run_audit_all(filter_ids=filter_ids, run_id=run_id)
@@ -473,45 +474,138 @@ class BulkTransformEngine:
         self._print_summary(results)
         return results
 
-    def run_dq_all(self, filter_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    def run_dq_all(
+        self,
+        filter_ids: Optional[List[str]] = None,
+        run_id: str = "",
+    ) -> Dict[str, Any]:
         """
-        Stage 2: Run DQ scan for all rows with run_data_quality=true.
+        Stage 2: For all rows with run_data_quality=true, execute the full pipeline:
+          Bronze read → incremental filter → SQL transform → DQ filter → Silver write
+          → watermark update → control table update → migration log.
+
+        Data is only written to Silver AFTER DQ checks pass.
+        Rows that fail DQ are diverted to the per-table quarantine table by DQEngine.
+
         Returns aggregate stats: {pass_rows, fail_rows, tables_checked}.
         """
         transforms = self.load_transforms_from_table(filter_ids=filter_ids)
         total_pass = 0
         total_fail = 0
         applied = 0
-        run_id = str(uuid.uuid4())
+        run_id = run_id or str(uuid.uuid4())
 
         print(f"\n{'='*65}")
-        print(f"  [DQ] Running data quality checks")
+        print(f"  [DQ] Running transform + DQ + Silver write  run_id={run_id}")
         print(f"{'='*65}")
 
         for t in transforms:
+            tid = t["id"]
             if not t.get("run_data_quality") or not t.get("dq_config_path", "").strip():
-                print(f"[DQ] [{t['id']}] Skipped (run_data_quality=false or no dq_config_path)")
+                print(f"[DQ] [{tid}] Skipped (run_data_quality=false or no dq_config_path)")
                 continue
 
-            full_target = f"{t['target_catalog']}.{t['target_schema']}.{t['target_table']}"
+            t_start = datetime.utcnow()
+            sc  = t.get("source_catalog", "")
+            ss  = t.get("source_schema", "")
+            st  = t.get("source_table", "")
+            tc  = t["target_catalog"]
+            ts  = t["target_schema"]
+            tt  = t["target_table"]
+            strategy      = t.get("load_strategy", "merge").lower()
+            pk_cols       = t.get("pk", [])
+            watermark_col = t.get("watermark_column", "")
+            full_source   = f"{sc}.{ss}.{st}" if sc and ss and st else ""
+            full_target   = f"{tc}.{ts}.{tt}"
+            source_count  = 0
+            rows_loaded   = 0
+
             try:
-                summary = self._run_data_quality(
-                    t["id"], full_target, t["dq_config_path"], run_id
+                self._ensure_catalog_schema(tc, ts)
+                self._bootstrap_control_row(tid, t.get("last_load_time", ""))
+
+                # ── Read source ───────────────────────────────────────────────
+                source_df = None
+                if full_source:
+                    source_df = self.spark.table(full_source)
+                    source_count = source_df.count()
+
+                # ── Incremental watermark filter ──────────────────────────────
+                load_type = t.get("load_type", "incremental")
+                if source_df is not None and watermark_col and load_type == "incremental":
+                    last_wm = self._get_last_watermark(tid)
+                    if last_wm is not None:
+                        source_df = source_df.filter(F.col(watermark_col) > F.lit(last_wm))
+
+                if source_df is not None:
+                    source_df.createOrReplaceTempView("source")
+
+                # ── SQL transform ─────────────────────────────────────────────
+                result_df = self.spark.sql(self._get_query(t))
+                transform_count = result_df.count()
+
+                if transform_count == 0:
+                    self._update_control(tid, "SUCCESS", 0, "", source_count)
+                    self._write_migration_log(
+                        t, run_id, full_source, full_target,
+                        0, t_start, "SUCCESS", "data_quality", "0 rows transformed — skipped write",
+                    )
+                    print(f"[DQ] [{tid}] 0 rows after transform — skipped")
+                    continue
+
+                # ── DQ filter — only valid rows reach Silver ──────────────────
+                write_df, _quarantine_df, dq_summary = self._run_dq_prewrite(
+                    tid, result_df, t["dq_config_path"], run_id
                 )
-                total_pass += summary.get("pass_rows", 0)
-                total_fail += summary.get("fail_rows", 0)
+                rows_loaded = dq_summary.get("pass_rows", 0)
+                total_pass += rows_loaded
+                total_fail += dq_summary.get("fail_rows", 0)
                 applied += 1
+
                 print(
-                    f"[DQ] [{t['id']}]  pass={summary.get('pass_rows', 0):,}  "
-                    f"fail={summary.get('fail_rows', 0):,}  "
-                    f"status={summary.get('status', '?')}"
+                    f"[DQ] [{tid}]  pass={rows_loaded:,}  "
+                    f"fail={dq_summary.get('fail_rows', 0):,}  "
+                    f"status={dq_summary.get('status', 'PASS')}"
                 )
+
+                if rows_loaded == 0:
+                    self._update_control(tid, "SUCCESS", 0, "", source_count)
+                    self._write_migration_log(
+                        t, run_id, full_source, full_target,
+                        0, t_start, "SUCCESS", "data_quality",
+                        "All rows failed DQ checks — Silver write skipped",
+                    )
+                    continue
+
+                # ── Write valid rows to Silver ────────────────────────────────
+                self._write(write_df, full_target, strategy, pk_cols)
+
+                # ── Watermark update ──────────────────────────────────────────
+                if watermark_col and watermark_col in write_df.columns:
+                    new_wm = write_df.agg(F.max(watermark_col)).first()[0]
+                    if new_wm is not None:
+                        self._update_watermark(tid, new_wm)
+
+                self._update_control(tid, "SUCCESS", rows_loaded, "", source_count)
+                self._write_migration_log(
+                    t, run_id, full_source, full_target,
+                    rows_loaded, t_start, "SUCCESS", "data_quality",
+                )
+
             except Exception as e:
-                logger.error("[DQ] [%s] Failed: %s", t["id"], e, exc_info=True)
-                print(f"[DQ] [{t['id']}] ✗ Failed: {e}")
+                logger.error("[DQ] [%s] Failed: %s", tid, e, exc_info=True)
+                print(f"[DQ] [{tid}] ✗ Failed: {e}")
+                try:
+                    self._update_control(tid, "FAILED", rows_loaded, str(e)[:2000], source_count)
+                    self._write_migration_log(
+                        t, run_id, full_source, full_target,
+                        rows_loaded, t_start, "FAILED", "data_quality", str(e)[:2000],
+                    )
+                except Exception:
+                    pass
 
         print(
-            f"\n[DQ]  Complete — {applied} table(s) scanned  "
+            f"\n[DQ]  Complete — {applied} table(s) processed  "
             f"pass={total_pass:,}  fail={total_fail:,}"
         )
         return {"pass_rows": total_pass, "fail_rows": total_fail, "tables_checked": applied}
@@ -646,16 +740,18 @@ class BulkTransformEngine:
           → write valid rows to Silver → update watermark
           → update control table → write migration log.
 
-        Skips the table when processed=yes in the config table.
+        Skips the table when processed=true in the config table.
+        DQ-enabled tables (run_data_quality=true) are deferred to the DQ stage,
+        which handles: Bronze read → transform → DQ filter → Silver write.
         """
         t_start = datetime.utcnow()
         tid = transform["id"]
         run_id = run_id or str(uuid.uuid4())
 
-        if str(transform.get("processed", "no")).lower() == "yes":
+        if str(transform.get("processed", "false")).lower() == "true":
             print(
-                f"\n[TRANSFORM] [{tid}] SKIPPED — processed=yes. "
-                f"Reset processed to 'no' in the config table to re-run."
+                f"\n[TRANSFORM] [{tid}] SKIPPED — processed=true. "
+                f"Reset processed to 'false' in the config table to re-run."
             )
             full_target = (
                 f"{transform.get('target_catalog','')}"
@@ -665,11 +761,34 @@ class BulkTransformEngine:
             self._write_migration_log(
                 transform, run_id, full_source="", full_target=full_target,
                 rows_loaded=0, t_start=t_start, status="SKIPPED",
-                stage="transform", message="processed=yes — skipped",
+                stage="transform", message="processed=true — skipped",
             )
             return BulkTransformResult(
                 transform_id=tid, status="SKIPPED",
-                error_message="processed=yes — skipped",
+                error_message="processed=true — skipped",
+            )
+
+        # Defer DQ-enabled tables to the DQ stage (Stage 2).
+        # Stage 2 handles: Bronze read → transform → DQ filter → Silver write.
+        # This ensures data is only written to Silver AFTER DQ checks pass.
+        if transform.get("run_data_quality") and transform.get("dq_config_path", "").strip():
+            full_target = (
+                f"{transform.get('target_catalog','')}"
+                f".{transform.get('target_schema','')}"
+                f".{transform.get('target_table','')}"
+            )
+            print(
+                f"\n[TRANSFORM] [{tid}] DEFERRED — run_data_quality=true. "
+                f"Transform + DQ + write will run in the DQ stage."
+            )
+            self._write_migration_log(
+                transform, run_id, full_source="", full_target=full_target,
+                rows_loaded=0, t_start=t_start, status="SKIPPED",
+                stage="transform", message="run_data_quality=true — deferred to DQ stage",
+            )
+            return BulkTransformResult(
+                transform_id=tid, status="SKIPPED",
+                error_message="run_data_quality=true — deferred to DQ stage",
             )
 
         sc  = transform.get("source_catalog", "")
@@ -737,38 +856,10 @@ class BulkTransformEngine:
                     rows_loaded=0, duration_seconds=duration,
                 )
 
-            # ── DQ pre-write ─────────────────────────────────────────────────
-            # Filter out bad rows BEFORE writing to Silver.
-            # Quarantined rows are written to the quarantine table by DQEngine.
+            # DQ-enabled tables are deferred to the DQ stage before this point,
+            # so all tables reaching here have run_data_quality=false.
             write_df = result_df
-            dq_config_path = transform.get("dq_config_path", "").strip()
-            if transform.get("run_data_quality") and dq_config_path:
-                write_df, _quarantine_df, dq_summary = self._run_dq_prewrite(
-                    tid, result_df, dq_config_path, run_id
-                )
-                rows_loaded = dq_summary.get("pass_rows", 0)
-                print(
-                    f"  [{tid}] DQ pre-write — "
-                    f"pass={dq_summary.get('pass_rows', 0):,}  "
-                    f"fail={dq_summary.get('fail_rows', 0):,}  "
-                    f"status={dq_summary.get('status', 'PASS')}"
-                )
-            else:
-                rows_loaded = transform_count
-
-            if rows_loaded == 0:
-                logger.info("  [%s] All rows failed DQ — skipping Silver write.", tid)
-                self._update_control(tid, "SUCCESS", 0, "", source_count)
-                self._write_migration_log(
-                    transform, run_id, full_source, full_target,
-                    0, t_start, "SUCCESS", "transform",
-                    "All rows failed DQ checks — Silver write skipped",
-                )
-                duration = (datetime.utcnow() - t_start).total_seconds()
-                return BulkTransformResult(
-                    transform_id=tid, status="SUCCESS",
-                    rows_loaded=0, duration_seconds=duration,
-                )
+            rows_loaded = transform_count
 
             # ── Write to Silver ───────────────────────────────────────────────
             self._write(write_df, full_target, strategy, pk_cols)
@@ -1216,9 +1307,9 @@ class BulkTransformEngine:
 
     def _write(self, df: DataFrame, full_target: str, strategy: str, pk_columns: List[str]) -> None:
         logger.info("  Writing → %s  strategy=%s", full_target, strategy)
-        if strategy == "full_refresh":
+        if strategy in ("overwrite", "full_refresh"):
             df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(full_target)
-            logger.info("  full_refresh complete: %s", full_target)
+            logger.info("  overwrite complete: %s", full_target)
         elif strategy == "append":
             df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(full_target)
             logger.info("  append complete: %s", full_target)

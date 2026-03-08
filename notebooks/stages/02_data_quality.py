@@ -1,20 +1,18 @@
 # Databricks notebook source
 
-# notebooks/stages/02_data_quality.py — Stage 2: Data Quality (post-write validation)
+# notebooks/stages/02_data_quality.py — Stage 2: Data Quality
 #
-# WHEN it runs and WHY two DQ passes exist:
+# Runs ONLY for tables where run_data_quality=true in silver_config.csv.
+# Stage 1 (transform) defers these tables entirely — no Silver write happens
+# in Stage 1 for DQ-enabled tables.
 #
-#   Pass 1 — Pre-write (Stage 1, inside transform_all):
-#     DQEngine.run() is called on the *transformed* DataFrame BEFORE writing
-#     to Silver.  Rows that fail "error"-level checks are diverted to the
-#     per-table quarantine table.  Only the validated (valid_df) rows reach
-#     the Silver table.  This is the primary data-quality gate.
+# This stage runs the full pipeline for each DQ-enabled table:
+#   Bronze read → incremental filter → SQL transform
+#   → DQ filter (quarantine bad rows) → write valid rows to Silver
+#   → watermark update → control table update → migration log
 #
-#   Pass 2 — Post-write (this notebook):
-#     A second scan runs against the Silver table AFTER the write.  This
-#     validates the final persisted state — catching any anomalies introduced
-#     by the merge/write process itself (schema drift, type coercion side-
-#     effects, etc.) and provides a reconciliation checkpoint for auditors.
+# Data is only written to Silver AFTER DQ checks pass — ensuring a single,
+# clean DQ gate with no duplicate processing.
 #
 # DQ rules are sourced per-table from the dq_config_path column in
 # silver_config.csv (e.g. config/dq/cust_001.yml).
@@ -59,7 +57,7 @@ engine = BulkTransformEngine(
 # COMMAND ----------
 #  Run post-write DQ scan for all applicable rows
 
-dq_stats = engine.run_dq_all(filter_ids=FILTER_IDS)
+dq_stats = engine.run_dq_all(filter_ids=FILTER_IDS, run_id=run_id)
 
 # COMMAND ----------
 #  Publish task values
