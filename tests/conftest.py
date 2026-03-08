@@ -83,20 +83,3 @@ def temp_config_dir(tmp_path, minimal_pipeline_yml):
         "  audit:\n    enabled: false\n"
     )
     return tmp_path
-
-
-@pytest.fixture
-def sample_source_tables_config():
-    """Multi-source pipeline config for MultiSourceReader tests."""
-    return {
-        "source_tables": [
-            {"alias": "customers", "table": "bronze.customers", "is_primary": True},
-            {"alias": "branches",  "table": "bronze.branches"},
-        ]
-    }
-
-
-@pytest.fixture
-def sample_single_source_config():
-    """Single-source pipeline config for MultiSourceReader tests."""
-    return {"source_table": "bronze.customers"}

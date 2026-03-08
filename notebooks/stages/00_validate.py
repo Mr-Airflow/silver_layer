@@ -70,8 +70,6 @@ dbutils.jobs.taskValues.set(key="any_run_dq",
     value=str(validation["any_run_dq"]).lower())
 dbutils.jobs.taskValues.set(key="any_run_governance",
     value=str(validation["any_run_governance"]).lower())
-dbutils.jobs.taskValues.set(key="any_run_audit",
-    value=str(validation["any_run_audit"]).lower())
 dbutils.jobs.taskValues.set(key="any_run_optimize",
     value=str(validation["any_run_optimize"]).lower())
 
@@ -79,6 +77,6 @@ print(
     f"\n[VALIDATE]  Pre-flight complete — {table_count} table(s) ready  run_id={run_id}\n"
     f"  Stages enabled →  DQ={validation['any_run_dq']}  "
     f"Gov={validation['any_run_governance']}  "
-    f"Audit={validation['any_run_audit']}  "
-    f"Optimize={validation['any_run_optimize']}"
+    f"Optimize={validation['any_run_optimize']}  "
+    f"Audit=yes (always)"
 )

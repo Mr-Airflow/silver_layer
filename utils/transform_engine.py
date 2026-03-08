@@ -1,16 +1,12 @@
 # utils/transform_engine.py
 
-# Unified transformation layer — two engines in one module:
+# BulkTransformEngine — CSV-driven full pipeline (read Bronze → incremental
+#                       filter → SQL → Silver write → DQ → Governance →
+#                       Optimize → Audit → watermark).
+#                       Reads silver_config.csv as the single config source.
 #
-# TransformationEngine  — YAML-driven chain (snake_case → rename → SQL chain
-#                         → column_transforms → derived_columns → drop_columns)
-#                         Used by the single-table staged notebooks (01_transform).
-#
-# BulkTransformEngine   — CSV-driven full pipeline (read Bronze → incremental
-#                         filter → SQL → Silver write → DQ → Governance →
-#                         Optimize → Audit → watermark).
-#                         Reads bulk_transforms.csv as the single config source
-#                         replacing pipeline_config.yml + transformation.yml.
+# Column utility functions — pure Python helpers (no Spark required):
+#   to_snake_case, apply_snake_case, apply_rename_columns, apply_drop_columns
 
 import csv
 import logging
@@ -18,7 +14,7 @@ import os
 import re
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils.logger import AUDIT_SCHEMA, DEFAULT_AUDIT_TABLE, MIGRATION_LOG_SCHEMA, PipelineLogger
 
@@ -26,229 +22,52 @@ import yaml
 from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    BooleanType,
-    DateType,
-    DecimalType,
-    DoubleType,
-    FloatType,
-    IntegerType,
-    LongType,
-    StringType,
-    TimestampType,
-)
 
 logger = logging.getLogger(__name__)
 
-# TransformationEngine — YAML-driven chain
 
-_DTYPE_MAP = {
-    "STRING": StringType(),
-    "VARCHAR": StringType(),
-    "INT": IntegerType(),
-    "INTEGER": IntegerType(),
-    "LONG": LongType(),
-    "BIGINT": LongType(),
-    "DOUBLE": DoubleType(),
-    "FLOAT": FloatType(),
-    "BOOLEAN": BooleanType(),
-    "BOOL": BooleanType(),
-    "DATE": DateType(),
-    "TIMESTAMP": TimestampType(),
-}
-
+# ---------------------------------------------------------------------------
+# Column utility functions — pure Python, no Spark runtime required
+# ---------------------------------------------------------------------------
 
 def to_snake_case(name: str) -> str:
+    """Convert any column name string to lower_snake_case."""
+    # Replace common separators with underscore
+    name = re.sub(r"[\s\-\.]", "_", name)
+    # Insert underscore before uppercase letters that follow lowercase/digit
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    # Insert underscore before a run of uppercase that precedes a lowercase
     name = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
-    name = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", name)
-    name = re.sub(r"[\s\-\.]+", "_", name)
-    name = re.sub(r"_+", "_", name)
-    return name.strip("_").lower()
+    # Collapse multiple underscores and strip leading/trailing
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name.lower()
 
 
-def apply_snake_case(df: DataFrame) -> DataFrame:
-    renamed = {}
+def apply_snake_case(df) -> "DataFrame":
+    """Rename all DataFrame columns to snake_case. No-op if already snake."""
     for col in df.columns:
         snake = to_snake_case(col)
         if snake != col:
             df = df.withColumnRenamed(col, snake)
-            renamed[col] = snake
-    if renamed:
-        logger.info("snake_case: renamed %d columns", len(renamed))
     return df
 
 
-def apply_rename_columns(df: DataFrame, rename_map: Dict[str, str]) -> DataFrame:
+def apply_rename_columns(df, rename_map: Dict[str, str]) -> "DataFrame":
+    """Apply an explicit column rename map. Logs a warning for missing columns."""
     for old, new in rename_map.items():
         if old in df.columns:
             df = df.withColumnRenamed(old, new)
         else:
-            logger.warning("rename_columns: '%s' not found — skipping", old)
+            logger.warning("apply_rename_columns: column %r not found — skipped", old)
     return df
 
 
-def apply_single_column_transform(df: DataFrame, t: Dict[str, Any]) -> DataFrame:
-    col = t.get("column")
-    act = t.get("action", "").lower()
-    p = t.get("params", {})
-
-    if not col or not act:
-        return df
-    if col not in df.columns:
-        logger.warning("column_transform: '%s' not in DataFrame — skipping '%s'", col, act)
-        return df
-
-    try:
-        if act == "cast":
-            key = p.get("dtype", "STRING").upper()
-            dtype = _DTYPE_MAP.get(key)
-            if dtype is None:
-                m = re.match(r"DECIMAL\((\d+),\s*(\d+)\)", key)
-                dtype = DecimalType(int(m.group(1)), int(m.group(2))) if m else None
-            if dtype:
-                df = df.withColumn(col, F.col(col).cast(dtype))
-        elif act == "trim":
-            df = df.withColumn(col, F.trim(F.col(col)))
-        elif act == "upper":
-            df = df.withColumn(col, F.upper(F.col(col)))
-        elif act == "lower":
-            df = df.withColumn(col, F.lower(F.col(col)))
-        elif act == "date_format":
-            df = df.withColumn(
-                col,
-                F.date_format(
-                    F.to_date(F.col(col), p.get("input_format", "yyyy-MM-dd")),
-                    p.get("output_format", "yyyy-MM-dd"),
-                ),
-            )
-        elif act in ("coalesce", "fill_null"):
-            df = df.withColumn(col, F.coalesce(F.col(col), F.lit(p.get("default_value"))))
-        elif act == "regex_replace":
-            df = df.withColumn(
-                col,
-                F.regexp_replace(F.col(col), p.get("pattern", ""), p.get("replacement", "")),
-            )
-        else:
-            logger.warning("Unknown column_transform action '%s' — skipping", act)
-    except Exception as exc:
-        logger.exception("column_transform '%s' on '%s': %s", act, col, exc)
+def apply_drop_columns(df, drops: List[str]) -> "DataFrame":
+    """Drop columns that exist in the DataFrame; silently skip missing ones."""
+    to_drop = [c for c in drops if c in df.columns]
+    if to_drop:
+        df = df.drop(*to_drop)
     return df
-
-
-def apply_derived_columns(df: DataFrame, derived: List[Dict]) -> DataFrame:
-    for entry in derived:
-        name = entry.get("name")
-        expr = entry.get("expression")
-        if name and expr:
-            try:
-                df = df.withColumn(name, F.expr(expr))
-            except Exception as exc:
-                logger.exception("derived_column '%s' expr='%s': %s", name, expr, exc)
-    return df
-
-
-def apply_drop_columns(df: DataFrame, drops: List[str]) -> DataFrame:
-    existing = [c for c in drops if c in df.columns]
-    if existing:
-        df = df.drop(*existing)
-    return df
-
-
-class TransformationEngine:
-    """
-    Runs the YAML-driven transformation chain from transformation.yml.
-
-    Steps: snake_case → rename → SQL chain → column_transforms
-           → derived_columns → drop_columns
-
-    Usage (single source):
-        engine = TransformationEngine(spark, cfg.transform)
-        silver_df = engine.run(bronze_df)
-
-    Usage (multi-source join):
-        silver_df = engine.run(primary_df, extra_views={"customers": df1, "branches": df2})
-    """
-
-    def __init__(self, spark: SparkSession, config: Dict[str, Any]):
-        self.spark = spark
-        self.config = config
-
-    def run(
-        self,
-        df: DataFrame,
-        extra_views: Optional[Dict[str, DataFrame]] = None,
-    ) -> DataFrame:
-        logger.info("Starting transformation pipeline")
-        initial_cols = len(df.columns)
-
-        if extra_views:
-            for alias, view_df in extra_views.items():
-                view_df.createOrReplaceTempView(alias)
-                logger.info("Registered extra view: '%s'", alias)
-
-        if self.config.get("snake_case_columns", False):
-            logger.info("Step 1: snake_case all columns")
-            df = apply_snake_case(df)
-
-        rename_map = self.config.get("rename_columns", {})
-        if rename_map:
-            logger.info("Step 2: %d explicit renames", len(rename_map))
-            df = apply_rename_columns(df, rename_map)
-
-        sql_transforms = self.config.get("sql_transforms", [])
-        if sql_transforms:
-            logger.info("Step 3: %d SQL transform(s)", len(sql_transforms))
-            df = self._run_sql_chain(df, sql_transforms)
-        else:
-            logger.info("Step 3: No sql_transforms — skipping")
-
-        col_transforms = self.config.get("column_transforms", [])
-        if col_transforms:
-            logger.info("Step 4: %d column transform(s)", len(col_transforms))
-            for t in col_transforms:
-                df = apply_single_column_transform(df, t)
-
-        derived = self.config.get("derived_columns", [])
-        if derived:
-            logger.info("Step 5: %d derived column(s)", len(derived))
-            df = apply_derived_columns(df, derived)
-
-        drops = self.config.get("drop_columns", [])
-        if drops:
-            logger.info("Step 6: dropping %d column(s)", len(drops))
-            df = apply_drop_columns(df, drops)
-
-        logger.info("Transformation complete: %d → %d columns", initial_cols, len(df.columns))
-        return df
-
-    def _run_sql_chain(self, df: DataFrame, steps: List[Dict]) -> DataFrame:
-        view = "silver_transform_source"
-        df.createOrReplaceTempView(view)
-
-        for i, step in enumerate(steps, 1):
-            name = step.get("name", f"step_{i}")
-            desc = step.get("description", "")
-            sql = step.get("sql", "").strip()
-
-            if not sql:
-                logger.warning("SQL transform '%s' has no SQL — skipping", name)
-                continue
-
-            rendered = sql.replace("{source}", view)
-            logger.info("SQL [%d/%d] '%s': %s", i, len(steps), name, desc)
-
-            try:
-                df = self.spark.sql(rendered)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"SQL transform '{name}' failed.\nRendered SQL:\n{rendered}\nError: {exc}"
-                ) from exc
-
-            view = f"silver_transform_{i}_{name}"
-            df.createOrReplaceTempView(view)
-            logger.info("  → %d rows, %d cols after '%s'", df.count(), len(df.columns), name)
-
-        return df
 
 
 # BulkTransformEngine — CSV-driven unified pipeline
@@ -282,16 +101,13 @@ class BulkTransformResult:
 
 def _safe_create_catalog(spark, catalog: str, *_args, **_kwargs) -> None:
     """
-    Verify that a catalog exists — never attempts to create it.
-    Catalog creation is admin/DBA responsibility (Databricks UI or Terraform).
-    Raises RuntimeError if the catalog is not found.
+    Create the catalog if it does not already exist.
     """
     existing = {row[0].lower() for row in spark.sql("SHOW CATALOGS").collect()}
     if catalog.lower() not in existing:
-        raise RuntimeError(
-            f"[INFRA] Catalog '{catalog}' does not exist. "
-            f"Please create it in the Databricks UI (Data → Create Catalog) and re-run the pipeline."
-        )
+        spark.sql(f"CREATE CATALOG IF NOT EXISTS `{catalog}`")
+        logger.info("[INFRA] Created catalog: %s", catalog)
+        print(f"[INFRA]    Created catalog : {catalog}")
 
 
 class BulkTransformEngine:
@@ -299,17 +115,17 @@ class BulkTransformEngine:
     CSV-driven unified pipeline — replaces pipeline_config.yml + transformation.yml.
 
     Reads silver_config.csv (written as a Delta table by the validate stage) and
-    runs the full Silver pipeline for every enabled row:
+    runs the full Silver pipeline for every row:
     Bronze read → incremental filter → SQL → Silver write
-    → DQ → Governance → Optimize/Vacuum → Audit → watermark update.
+    → DQ → Governance → Optimize → Audit → watermark update.
 
-    Stage flags (per CSV row, default shown):
-      run_data_quality      false  opt-in  (needs dq_config_path)
-      run_governance        false  opt-in  (needs governance_config_path)
-      run_audit             true   opt-out
-      run_optimize          true   opt-out
+    Stage flags (per CSV row, yes/no, default shown):
+      run_data_quality  no   opt-in  (needs dq_config_path)
+      run_governance    no   opt-in  (needs governance_config_path)
+      run_optimize      no   opt-in
 
-    Multi-value CSV fields use "|" as the separator (pk_columns, zorder_columns).
+    Audit always runs for every row (no flag needed).
+    The pk column is pipe-separated for composite keys: customer_id|order_id
     SQL in the "query" column references Spark temp view "source" (the Bronze DF).
     Complex SQL can live in a .sql file referenced via the sql_file column.
 
@@ -323,6 +139,7 @@ class BulkTransformEngine:
         "last_run_status  STRING, "
         "last_run_ts      TIMESTAMP, "
         "rows_loaded      LONG, "
+        "source_count     LONG, "
         "error_message    STRING"
     )
 
@@ -381,9 +198,8 @@ class BulkTransformEngine:
     def load_transforms(
         self,
         filter_ids: Optional[List[str]] = None,
-        include_disabled: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Load and parse bulk_transforms.csv, normalising all fields."""
+        """Load and parse silver_config.csv, normalising all fields."""
         full_path = os.path.join(self.config_base_path, self.csv_path)
         if not os.path.exists(full_path):
             raise FileNotFoundError(f"[BulkTransform] CSV not found: {full_path}")
@@ -394,35 +210,25 @@ class BulkTransformEngine:
             for raw in reader:
                 row = {k.strip(): (v.strip() if v else "") for k, v in raw.items()}
 
-                row["enabled"] = row.get("enabled", "true").lower() != "false"
-                if not row["enabled"] and not include_disabled:
-                    continue
                 if filter_ids and row["id"] not in filter_ids:
                     continue
 
-                for flag in ("run_data_quality", "run_governance"):
-                    row[flag] = row.get(flag, "").lower() == "true"
-                for flag in ("run_audit", "run_optimize"):
-                    row[flag] = row.get(flag, "").lower() != "false"
+                for flag in ("run_data_quality", "run_governance", "run_optimize"):
+                    row[flag] = row.get(flag, "").lower() == "yes"
 
-                row["pk_columns"] = _split_pipe(row.get("pk_columns", ""))
-                row["zorder_columns"] = _split_pipe(row.get("zorder_columns", ""))
-
-                vh = row.get("vacuum_retain_hours", "")
-                row["vacuum_retain_hours"] = int(vh) if vh else 168
+                row["pk"] = _split_pipe(row.get("pk", ""))
 
                 lt = row.get("load_type", "").strip().lower()
                 row["load_type"] = lt if lt in ("incremental", "full_refresh") else "incremental"
 
                 rows.append(row)
 
-        logger.info("[BulkTransform] Loaded %d enabled transform(s) from %s", len(rows), full_path)
+        logger.info("[BulkTransform] Loaded %d transform(s) from %s", len(rows), full_path)
         return rows
 
     def load_transforms_from_table(
         self,
         filter_ids: Optional[List[str]] = None,
-        include_disabled: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load and parse transforms from the config Delta table written by validate_all().
@@ -434,7 +240,7 @@ class BulkTransformEngine:
             logger.warning(
                 "[BulkTransform] config_table not set in parameter.yml — falling back to CSV"
             )
-            return self.load_transforms(filter_ids=filter_ids, include_disabled=include_disabled)
+            return self.load_transforms(filter_ids=filter_ids)
 
         try:
             df = self.spark.table(self.config_table)
@@ -443,7 +249,7 @@ class BulkTransformEngine:
                 "[BulkTransform] Cannot read config table %s (%s) — falling back to CSV",
                 self.config_table, exc,
             )
-            return self.load_transforms(filter_ids=filter_ids, include_disabled=include_disabled)
+            return self.load_transforms(filter_ids=filter_ids)
 
         result: List[Dict[str, Any]] = []
         for raw in df.collect():
@@ -452,22 +258,13 @@ class BulkTransformEngine:
                 for k, v in raw.asDict().items()
             }
 
-            row["enabled"] = str(row.get("enabled", "true")).lower() not in ("false", "0")
-            if not row["enabled"] and not include_disabled:
-                continue
             if filter_ids and row.get("id") not in filter_ids:
                 continue
 
-            for flag in ("run_data_quality", "run_governance"):
-                row[flag] = str(row.get(flag, "")).lower() == "true"
-            for flag in ("run_audit", "run_optimize"):
-                row[flag] = str(row.get(flag, "")).lower() not in ("false", "0")
+            for flag in ("run_data_quality", "run_governance", "run_optimize"):
+                row[flag] = str(row.get(flag, "")).lower() == "yes"
 
-            row["pk_columns"]     = _split_pipe(str(row.get("pk_columns", "")))
-            row["zorder_columns"] = _split_pipe(str(row.get("zorder_columns", "")))
-
-            vh = row.get("vacuum_retain_hours", "")
-            row["vacuum_retain_hours"] = int(vh) if vh else 168
+            row["pk"] = _split_pipe(str(row.get("pk", "")))
 
             lt = str(row.get("load_type", "")).strip().lower()
             row["load_type"] = lt if lt in ("incremental", "full_refresh") else "incremental"
@@ -475,22 +272,19 @@ class BulkTransformEngine:
             result.append(row)
 
         logger.info(
-            "[BulkTransform] Loaded %d enabled transform(s) from config table %s",
+            "[BulkTransform] Loaded %d transform(s) from config table %s",
             len(result), self.config_table,
         )
         return result
 
     def mark_processed(self, filter_ids: Optional[List[str]] = None) -> None:
         """
-        Update is_processed = 'True' in the config Delta table for all rows
-        that were part of this pipeline run.
-
-        If filter_ids is provided, only those IDs are updated; otherwise every
-        enabled row is marked processed.
+        Set processed = 'yes' in the config Delta table for all rows in this run.
+        If filter_ids is provided, only those IDs are updated; otherwise all rows.
         """
         if not self.config_table:
             logger.warning(
-                "[BulkTransform] config_table not set — cannot mark is_processed"
+                "[BulkTransform] config_table not set — cannot mark processed"
             )
             return
 
@@ -498,232 +292,53 @@ class BulkTransformEngine:
             escaped = "', '".join(filter_ids)
             where_clause = f"id IN ('{escaped}')"
         else:
-            where_clause = "enabled NOT IN ('false', 'False', '0')"
+            where_clause = "1=1"
 
         try:
             self.spark.sql(
-                f"UPDATE {self.config_table} SET is_processed = 'True' WHERE {where_clause}"
+                f"UPDATE {self.config_table} SET processed = 'yes' WHERE {where_clause}"
             )
-            target = ", ".join(filter_ids) if filter_ids else "all enabled rows"
-            logger.info("[BulkTransform] Marked is_processed=True for: %s", target)
-            print(f"[AUDIT]  Marked is_processed=True in {self.config_table} for: {target}")
+            target = ", ".join(filter_ids) if filter_ids else "all rows"
+            logger.info("[BulkTransform] Marked processed=yes for: %s", target)
+            print(f"[AUDIT]  Marked processed=yes in {self.config_table} for: {target}")
         except Exception as exc:
-            logger.error("[BulkTransform] Failed to mark is_processed: %s", exc, exc_info=True)
-            print(f"[AUDIT] ✗ Could not update is_processed: {exc}")
+            logger.error("[BulkTransform] Failed to mark processed: %s", exc, exc_info=True)
+            print(f"[AUDIT] ✗ Could not update processed: {exc}")
 
     def run_all(
         self,
         filter_ids: Optional[List[str]] = None,
         stop_on_error: bool = False,
     ) -> List[BulkTransformResult]:
-        """Execute all enabled transforms (optionally filtered by ID list)."""
-        transforms = self.load_transforms(filter_ids=filter_ids)
-        if not transforms:
-            logger.warning("[BulkTransform] No enabled transforms found to run.")
-            return []
+        """
+        Execute the full Silver pipeline in staged order using the same code
+        path as the staged notebooks (00–05).  Both entry points are now
+        identical — there is only one execution model.
 
-        results: List[BulkTransformResult] = []
-        total = len(transforms)
-
+        Order:
+          0. validate_all        — infra setup + source accessibility checks
+          1. transform_all       — Bronze read → DQ pre-write → Silver write
+          2. run_governance_all  — Unity Catalog tags, masking, grants
+          3. run_optimize_all    — OPTIMIZE
+          4. run_audit_all       — write audit records
+          5. mark_processed      — set processed=yes in config table
+        """
+        run_id = str(uuid.uuid4())
         logger.info("=" * 65)
-        logger.info("  BulkTransformEngine — starting %d transform(s)", total)
-        logger.info("  load_type: per-row (incremental or full_refresh)")
+        logger.info("  BulkTransformEngine.run_all — run_id=%s", run_id)
         logger.info("=" * 65)
 
-        for idx, transform in enumerate(transforms, start=1):
-            tid = transform["id"]
-            logger.info(
-                "[%d/%d] Starting id=%r  desc=%r",
-                idx, total, tid, transform.get("description", ""),
-            )
-            try:
-                result = self.run_one(transform)
-            except Exception as exc:
-                logger.error("[%d/%d] FAILED id=%r : %s", idx, total, tid, exc, exc_info=True)
-                result = BulkTransformResult(
-                    transform_id=tid, status="FAILED", error_message=str(exc),
-                )
-                if stop_on_error:
-                    results.append(result)
-                    raise
-            results.append(result)
+        self.validate_all(filter_ids=filter_ids)
+        results = self.transform_all(
+            filter_ids=filter_ids, stop_on_error=stop_on_error, run_id=run_id
+        )
+        self.run_governance_all(filter_ids=filter_ids)
+        self.run_optimize_all(filter_ids=filter_ids)
+        self.run_audit_all(filter_ids=filter_ids, run_id=run_id)
+        self.mark_processed(filter_ids=filter_ids)
 
         self._print_summary(results)
         return results
-
-    def run_one(self, transform: Dict[str, Any]) -> BulkTransformResult:
-        """
-        Full pipeline for one CSV row.
-
-        1.  Resolve fields + generate run_id
-        2.  Ensure Silver catalog/schema
-        3.  Bootstrap control-table row
-        4.  Read Bronze source → temp view "source"
-        5.  Incremental filter (watermark_column, incremental mode)
-        6.  Execute SQL → transformed DataFrame
-        7.  Write to Silver (merge / append / full_refresh)
-        8.  Data Quality   if run_data_quality=true + dq_config_path set
-        9.  Governance     if run_governance=true  + governance_config_path set
-        10. OPTIMIZE+VACUUM if run_optimize=true
-        11. Update watermark
-        12. Audit log      if run_audit=true
-        13. Update control table
-        """
-        t_start = datetime.utcnow()
-        run_id = str(uuid.uuid4())
-        tid = transform["id"]
-
-        source_catalog = transform.get("source_catalog", "")
-        source_schema  = transform.get("source_schema", "")
-        source_table   = transform.get("source_table", "")
-        target_catalog = transform["target_catalog"]
-        target_schema  = transform["target_schema"]
-        target_table   = transform["target_table"]
-        strategy       = transform.get("load_strategy", "merge").lower()
-        pk_cols        = transform.get("pk_columns", [])
-        watermark_col  = transform.get("watermark_column", "")
-        zorder_cols    = transform.get("zorder_columns", [])
-        vacuum_hours   = transform.get("vacuum_retain_hours", 168)
-
-        full_source = (
-            f"{source_catalog}.{source_schema}.{source_table}"
-            if source_catalog and source_schema and source_table else ""
-        )
-        full_target = f"{target_catalog}.{target_schema}.{target_table}"
-
-        source_count = 0
-        rows_loaded  = 0
-        dq_summary: Dict[str, Any] = {}
-
-        logger.info(
-            "  source=%s  target=%s  strategy=%s  wm_col=%r",
-            full_source or "(none)", full_target, strategy, watermark_col or "(none)",
-        )
-        logger.info(
-            "  stages → DQ=%s  Gov=%s  Audit=%s  Optimize=%s",
-            transform.get("run_data_quality"), transform.get("run_governance"),
-            transform.get("run_audit"), transform.get("run_optimize"),
-        )
-
-        try:
-            if strategy in ("merge", "scd2") and not pk_cols:
-                raise ValueError(f"[{tid}] load_strategy='{strategy}' requires pk_columns.")
-
-            self._ensure_catalog_schema(target_catalog, target_schema)
-            self._bootstrap_control_row(tid, transform.get("last_load_time", ""))
-
-            if full_source:
-                source_df = self.spark.table(full_source)
-                source_count = source_df.count()
-                logger.info("  Source rows: %s", f"{source_count:,}")
-            else:
-                source_df = None
-                logger.info("  No source_table — SQL must reference tables directly.")
-
-            load_type = transform.get("load_type", "incremental")
-            if source_df is not None and watermark_col and load_type == "incremental":
-                last_wm = self._get_last_watermark(tid)
-                if last_wm is not None:
-                    before = source_df.count()
-                    source_df = source_df.filter(F.col(watermark_col) > F.lit(last_wm))
-                    logger.info(
-                        "  Incremental filter %r > %s : %s → %s rows",
-                        watermark_col, last_wm, f"{before:,}", f"{source_df.count():,}",
-                    )
-                else:
-                    logger.info("  No previous watermark — initial full load for id=%r", tid)
-
-            if source_df is not None:
-                source_df.createOrReplaceTempView("source")
-
-            result_df = self.spark.sql(self._get_query(transform))
-            transform_count = result_df.count()
-            logger.info("  Transformed rows: %s", f"{transform_count:,}")
-
-            if transform_count == 0:
-                logger.info("  0 rows — skipping write for id=%r", tid)
-                rows_loaded = (
-                    self.spark.table(full_target).count()
-                    if self.spark.catalog.tableExists(full_target) else 0
-                )
-                self._update_control(tid, "SUCCESS", rows_loaded, "")
-                if transform.get("run_audit", True):
-                    self._write_audit_log(
-                        transform, run_id, full_target,
-                        source_count, rows_loaded, dq_summary, t_start, "SUCCESS",
-                    )
-                self._write_migration_log(
-                    transform, run_id, full_source, full_target,
-                    rows_loaded, t_start, "SUCCESS", "transform", "0 rows transformed — skipped write",
-                )
-                duration = (datetime.utcnow() - t_start).total_seconds()
-                return BulkTransformResult(
-                    transform_id=tid, status="SUCCESS",
-                    rows_loaded=rows_loaded, duration_seconds=duration,
-                )
-
-            self._write(result_df, full_target, strategy, pk_cols)
-            rows_loaded = self.spark.table(full_target).count()
-            logger.info("  Silver rows after write: %s", f"{rows_loaded:,}")
-
-            dq_config_path = transform.get("dq_config_path", "").strip()
-            if transform.get("run_data_quality") and dq_config_path:
-                dq_summary = self._run_data_quality(tid, full_target, dq_config_path, run_id)
-
-            gov_config_path = transform.get("governance_config_path", "").strip()
-            if transform.get("run_governance") and gov_config_path:
-                self._run_governance(transform, gov_config_path)
-
-            if transform.get("run_optimize", True):
-                self._optimize_and_vacuum(full_target, zorder_cols, vacuum_hours)
-
-            if watermark_col and watermark_col in result_df.columns:
-                new_wm = result_df.agg(F.max(watermark_col)).first()[0]
-                if new_wm is not None:
-                    self._update_watermark(tid, new_wm)
-                    logger.info("  Watermark updated → %s", new_wm)
-
-            if transform.get("run_audit", True):
-                self._write_audit_log(
-                    transform, run_id, full_target,
-                    source_count, rows_loaded, dq_summary, t_start, "SUCCESS",
-                )
-
-            self._update_control(tid, "SUCCESS", rows_loaded, "")
-            self._write_migration_log(
-                transform, run_id, full_source, full_target,
-                rows_loaded, t_start, "SUCCESS", "transform",
-            )
-
-            duration = (datetime.utcnow() - t_start).total_seconds()
-            logger.info("  [%s]  Complete — %s rows  (%.1fs)", tid, f"{rows_loaded:,}", duration)
-            return BulkTransformResult(
-                transform_id=tid, status="SUCCESS",
-                rows_loaded=rows_loaded, duration_seconds=duration,
-            )
-
-        except Exception as exc:
-            err_msg = str(exc)[:2000]
-            if transform.get("run_audit", True):
-                try:
-                    self._write_audit_log(
-                        transform, run_id, full_target,
-                        source_count, rows_loaded, dq_summary, t_start, "FAILED", err_msg,
-                    )
-                except Exception:
-                    pass
-            try:
-                self._update_control(tid, "FAILED", rows_loaded, err_msg)
-            except Exception:
-                pass
-            try:
-                self._write_migration_log(
-                    transform, run_id, full_source, full_target,
-                    rows_loaded, t_start, "FAILED", "transform", err_msg,
-                )
-            except Exception:
-                pass
-            raise
 
     #  Stage-specific public API (used by 6-stage pipeline notebooks) 
 
@@ -741,26 +356,30 @@ class BulkTransformEngine:
 
         Returns dict:
           {
-            "table_results": [{id, source_ok, source_count}, ...],
-            "any_run_dq":         bool,
-            "any_run_governance":  bool,
-            "any_run_audit":       bool,
-            "any_run_optimize":    bool,
+            "table_results":     [{id, source_ok, source_count}, ...],
+            "any_run_dq":        bool,
+            "any_run_governance": bool,
+            "any_run_optimize":   bool,
           }
         """
-        #  Step 1: infrastructure setup from parameter.yml 
+        #  Step 1: infra setup from parameter.yml
         params = self._load_parameter_yml()
         if params:
             self._ensure_infrastructure(params)
+            # Write CSV → Delta table so all subsequent stages read a single
+            # consistent snapshot.  After this point every stage uses
+            # load_transforms_from_table() — the CSV is never read again.
             self._load_config_as_table(params)
 
-        transforms = self.load_transforms(filter_ids=filter_ids)
+        # Read from the Delta config table (not the CSV) so validate_all and
+        # all downstream stages share the exact same row data.
+        transforms = self.load_transforms_from_table(filter_ids=filter_ids)
         if not transforms:
-            logger.warning("[VALIDATE] No enabled transforms found.")
+            logger.warning("[VALIDATE] No transforms found.")
             return {
                 "table_results": [],
                 "any_run_dq": False, "any_run_governance": False,
-                "any_run_audit": False, "any_run_optimize": False,
+                "any_run_optimize": False,
             }
 
         print(f"\n{'='*65}")
@@ -807,8 +426,7 @@ class BulkTransformEngine:
             "table_results":      results,
             "any_run_dq":         any(t.get("run_data_quality", False) for t in transforms),
             "any_run_governance":  any(t.get("run_governance", False) for t in transforms),
-            "any_run_audit":       any(t.get("run_audit", True) for t in transforms),
-            "any_run_optimize":    any(t.get("run_optimize", True) for t in transforms),
+            "any_run_optimize":    any(t.get("run_optimize", False) for t in transforms),
         }
 
     def transform_all(
@@ -818,13 +436,13 @@ class BulkTransformEngine:
         run_id: str = "",
     ) -> List["BulkTransformResult"]:
         """
-        Stage 1: Transform + write for all enabled rows.
+        Stage 1: Transform + write for all rows.
         Does NOT run DQ, governance, optimize, or audit — those are separate stages.
         Returns list of BulkTransformResult.
         """
         transforms = self.load_transforms_from_table(filter_ids=filter_ids)
         if not transforms:
-            logger.warning("[TRANSFORM] No enabled transforms found.")
+            logger.warning("[TRANSFORM] No transforms found.")
             return []
 
         run_id = run_id or str(uuid.uuid4())
@@ -932,7 +550,7 @@ class BulkTransformEngine:
         start_time_epoch: int = 0,
     ) -> None:
         """
-        Stage 4: Write audit records for all rows with run_audit=true.
+        Stage 4: Write audit records for all rows (audit always runs).
         Reads run status and rows_loaded from the control table.
         """
         transforms = self.load_transforms_from_table(filter_ids=filter_ids)
@@ -958,21 +576,19 @@ class BulkTransformEngine:
         print(f"{'='*65}")
 
         for t in transforms:
-            if not t.get("run_audit", True):
-                print(f"[AUDIT] [{t['id']}] Skipped (run_audit=false)")
-                continue
-
             tid = t["id"]
             full_target = f"{t['target_catalog']}.{t['target_schema']}.{t['target_table']}"
             ctrl = ctrl_map.get(tid)
-            status      = (ctrl["last_run_status"] or "UNKNOWN") if ctrl else "UNKNOWN"
-            rows_loaded = int(ctrl["rows_loaded"] or 0) if ctrl else 0
-            err_msg     = (ctrl["error_message"] or "") if ctrl else ""
+            status       = (ctrl["last_run_status"] or "UNKNOWN") if ctrl else "UNKNOWN"
+            rows_loaded  = int(ctrl["rows_loaded"]   or 0)        if ctrl else 0
+            # source_count is stored by _update_control during transform step
+            source_count = int(ctrl["source_count"]  or 0)        if ctrl else 0
+            err_msg      = (ctrl["error_message"]    or "")        if ctrl else ""
 
             try:
                 self._write_audit_log(
                     t, run_id, full_target,
-                    source_count=0,
+                    source_count=source_count,
                     rows_loaded=rows_loaded,
                     dq_summary={},
                     t_start=t_start,
@@ -980,7 +596,10 @@ class BulkTransformEngine:
                     error_message=err_msg,
                 )
                 written += 1
-                print(f"[AUDIT] [{tid}]  Audit written — status={status}  rows={rows_loaded:,}")
+                print(
+                    f"[AUDIT] [{tid}]  Audit written — "
+                    f"status={status}  source={source_count:,}  rows={rows_loaded:,}"
+                )
             except Exception as e:
                 logger.error("[AUDIT] [%s] Failed: %s", tid, e, exc_info=True)
                 print(f"[AUDIT] [{tid}] ✗ Failed: {e}")
@@ -989,27 +608,25 @@ class BulkTransformEngine:
 
     def run_optimize_all(self, filter_ids: Optional[List[str]] = None) -> int:
         """
-        Stage 5: OPTIMIZE + VACUUM for all rows with run_optimize=true.
+        Stage 5: OPTIMIZE for all rows with run_optimize=yes.
         Returns count of tables optimized.
         """
         transforms = self.load_transforms_from_table(filter_ids=filter_ids)
         applied = 0
 
         print(f"\n{'='*65}")
-        print(f"  [OPTIMIZE] Running OPTIMIZE + VACUUM")
+        print(f"  [OPTIMIZE] Running OPTIMIZE")
         print(f"{'='*65}")
 
         for t in transforms:
-            if not t.get("run_optimize", True):
-                print(f"[OPTIMIZE] [{t['id']}] Skipped (run_optimize=false)")
+            if not t.get("run_optimize", False):
+                print(f"[OPTIMIZE] [{t['id']}] Skipped (run_optimize=no)")
                 continue
 
             full_target = f"{t['target_catalog']}.{t['target_schema']}.{t['target_table']}"
-            zorder_cols  = t.get("zorder_columns", [])
-            vacuum_hours = t.get("vacuum_retain_hours", 168)
 
             try:
-                self._optimize_and_vacuum(full_target, zorder_cols, vacuum_hours)
+                self._optimize_and_vacuum(full_target)
                 applied += 1
                 print(f"[OPTIMIZE] [{t['id']}]  Optimized {full_target}")
             except Exception as e:
@@ -1023,40 +640,36 @@ class BulkTransformEngine:
         self, transform: Dict[str, Any], run_id: str = ""
     ) -> "BulkTransformResult":
         """
-        Transform-only for one CSV row:
-          read Bronze → incremental filter → SQL → write Silver
-          → update watermark → update control table → write migration log.
-        Does NOT run DQ, governance, optimize, or audit.
+        Full transform pipeline for one CSV row (used by staged pipeline):
+          read Bronze → incremental filter → SQL transform
+          → DQ pre-write (if enabled, filters bad rows before Silver write)
+          → write valid rows to Silver → update watermark
+          → update control table → write migration log.
 
-        Skips the table entirely when is_processed=true in the config table.
+        Skips the table when processed=yes in the config table.
         """
         t_start = datetime.utcnow()
         tid = transform["id"]
         run_id = run_id or str(uuid.uuid4())
 
-        # ------------------------------------------------------------------
-        # is_processed guard — skip already-processed tables
-        # ------------------------------------------------------------------
-        if str(transform.get("is_processed", "false")).lower() == "true":
+        if str(transform.get("processed", "no")).lower() == "yes":
             print(
-                f"\n[TRANSFORM] [{tid}] SKIPPED — table already processed "
-                f"(is_processed=true). Reset is_processed to false in the "
-                f"config table to re-run."
+                f"\n[TRANSFORM] [{tid}] SKIPPED — processed=yes. "
+                f"Reset processed to 'no' in the config table to re-run."
+            )
+            full_target = (
+                f"{transform.get('target_catalog','')}"
+                f".{transform.get('target_schema','')}"
+                f".{transform.get('target_table','')}"
             )
             self._write_migration_log(
-                transform, run_id,
-                full_source="",
-                full_target=f"{transform.get('target_catalog','')}.{transform.get('target_schema','')}.{transform.get('target_table','')}",
-                rows_loaded=0,
-                t_start=t_start,
-                status="SKIPPED",
-                stage="transform",
-                message="is_processed=true — skipped",
+                transform, run_id, full_source="", full_target=full_target,
+                rows_loaded=0, t_start=t_start, status="SKIPPED",
+                stage="transform", message="processed=yes — skipped",
             )
             return BulkTransformResult(
-                transform_id=tid,
-                status="SKIPPED",
-                error_message="is_processed=true — skipped",
+                transform_id=tid, status="SKIPPED",
+                error_message="processed=yes — skipped",
             )
 
         sc  = transform.get("source_catalog", "")
@@ -1066,71 +679,112 @@ class BulkTransformEngine:
         ts  = transform["target_schema"]
         tt  = transform["target_table"]
         strategy      = transform.get("load_strategy", "merge").lower()
-        pk_cols       = transform.get("pk_columns", [])
+        pk_cols       = transform.get("pk", [])
         watermark_col = transform.get("watermark_column", "")
 
-        full_source = f"{sc}.{ss}.{st}" if sc and ss and st else ""
-        full_target = f"{tc}.{ts}.{tt}"
-        rows_loaded = 0
+        full_source  = f"{sc}.{ss}.{st}" if sc and ss and st else ""
+        full_target  = f"{tc}.{ts}.{tt}"
+        source_count = 0
+        rows_loaded  = 0
+        dq_summary: Dict[str, Any] = {}
 
         try:
             if strategy in ("merge", "scd2") and not pk_cols:
-                raise ValueError(f"[{tid}] load_strategy='{strategy}' requires pk_columns.")
+                raise ValueError(f"[{tid}] load_strategy='{strategy}' requires pk.")
 
             self._ensure_catalog_schema(tc, ts)
             self._bootstrap_control_row(tid, transform.get("last_load_time", ""))
 
+            # ── Read source ──────────────────────────────────────────────────
             source_df = None
             if full_source:
                 source_df = self.spark.table(full_source)
-                logger.info("  [%s] Source rows: %s", tid, f"{source_df.count():,}")
+                source_count = source_df.count()
+                logger.info("  [%s] Source rows: %s", tid, f"{source_count:,}")
             else:
                 logger.info("  [%s] No source_table — SQL references tables directly.", tid)
 
+            # ── Incremental watermark filter ──────────────────────────────────
             load_type = transform.get("load_type", "incremental")
             if source_df is not None and watermark_col and load_type == "incremental":
                 last_wm = self._get_last_watermark(tid)
                 if last_wm is not None:
-                    before = source_df.count()
                     source_df = source_df.filter(F.col(watermark_col) > F.lit(last_wm))
                     logger.info(
-                        "  [%s] Incremental filter %r > %s: %s → %s rows",
-                        tid, watermark_col, last_wm,
-                        f"{before:,}", f"{source_df.count():,}",
+                        "  [%s] Incremental filter: %r > %s applied", tid, watermark_col, last_wm
                     )
                 else:
-                    logger.info("  [%s] No previous watermark — full initial load.", tid)
+                    logger.info("  [%s] No previous watermark — initial full load.", tid)
 
             if source_df is not None:
                 source_df.createOrReplaceTempView("source")
 
+            # ── SQL transform ────────────────────────────────────────────────
             result_df = self.spark.sql(self._get_query(transform))
             transform_count = result_df.count()
             logger.info("  [%s] Transformed rows: %s", tid, f"{transform_count:,}")
 
-            msg = ""
-            if transform_count > 0:
-                self._write(result_df, full_target, strategy, pk_cols)
-                rows_loaded = self.spark.table(full_target).count()
-                logger.info("  [%s] Silver rows after write: %s", tid, f"{rows_loaded:,}")
-
-                if watermark_col and watermark_col in result_df.columns:
-                    new_wm = result_df.agg(F.max(watermark_col)).first()[0]
-                    if new_wm is not None:
-                        self._update_watermark(tid, new_wm)
-                        logger.info("  [%s] Watermark updated → %s", tid, new_wm)
-            else:
-                msg = "0 rows transformed — skipped write"
-                logger.info("  [%s] 0 rows — skipping write.", tid)
-                rows_loaded = (
-                    self.spark.table(full_target).count()
-                    if self.spark.catalog.tableExists(full_target) else 0
+            if transform_count == 0:
+                logger.info("  [%s] 0 rows — skipping Silver write.", tid)
+                self._update_control(tid, "SUCCESS", 0, "", source_count)
+                self._write_migration_log(
+                    transform, run_id, full_source, full_target,
+                    0, t_start, "SUCCESS", "transform", "0 rows transformed — skipped write",
+                )
+                duration = (datetime.utcnow() - t_start).total_seconds()
+                return BulkTransformResult(
+                    transform_id=tid, status="SUCCESS",
+                    rows_loaded=0, duration_seconds=duration,
                 )
 
-            self._update_control(tid, "SUCCESS", rows_loaded, "")
+            # ── DQ pre-write ─────────────────────────────────────────────────
+            # Filter out bad rows BEFORE writing to Silver.
+            # Quarantined rows are written to the quarantine table by DQEngine.
+            write_df = result_df
+            dq_config_path = transform.get("dq_config_path", "").strip()
+            if transform.get("run_data_quality") and dq_config_path:
+                write_df, _quarantine_df, dq_summary = self._run_dq_prewrite(
+                    tid, result_df, dq_config_path, run_id
+                )
+                rows_loaded = dq_summary.get("pass_rows", 0)
+                print(
+                    f"  [{tid}] DQ pre-write — "
+                    f"pass={dq_summary.get('pass_rows', 0):,}  "
+                    f"fail={dq_summary.get('fail_rows', 0):,}  "
+                    f"status={dq_summary.get('status', 'PASS')}"
+                )
+            else:
+                rows_loaded = transform_count
+
+            if rows_loaded == 0:
+                logger.info("  [%s] All rows failed DQ — skipping Silver write.", tid)
+                self._update_control(tid, "SUCCESS", 0, "", source_count)
+                self._write_migration_log(
+                    transform, run_id, full_source, full_target,
+                    0, t_start, "SUCCESS", "transform",
+                    "All rows failed DQ checks — Silver write skipped",
+                )
+                duration = (datetime.utcnow() - t_start).total_seconds()
+                return BulkTransformResult(
+                    transform_id=tid, status="SUCCESS",
+                    rows_loaded=0, duration_seconds=duration,
+                )
+
+            # ── Write to Silver ───────────────────────────────────────────────
+            self._write(write_df, full_target, strategy, pk_cols)
+            logger.info("  [%s] Silver rows written: %s", tid, f"{rows_loaded:,}")
+
+            # ── Watermark update ──────────────────────────────────────────────
+            if watermark_col and watermark_col in write_df.columns:
+                new_wm = write_df.agg(F.max(watermark_col)).first()[0]
+                if new_wm is not None:
+                    self._update_watermark(tid, new_wm)
+                    logger.info("  [%s] Watermark updated → %s", tid, new_wm)
+
+            self._update_control(tid, "SUCCESS", rows_loaded, "", source_count)
             self._write_migration_log(
                 transform, run_id, full_source, full_target,
-                rows_loaded, t_start, "SUCCESS", "transform", msg,
+                rows_loaded, t_start, "SUCCESS", "transform",
             )
             duration = (datetime.utcnow() - t_start).total_seconds()
             return BulkTransformResult(
@@ -1141,7 +795,7 @@ class BulkTransformEngine:
         except Exception as exc:
             err_msg = str(exc)[:2000]
             try:
-                self._update_control(tid, "FAILED", rows_loaded, err_msg)
+                self._update_control(tid, "FAILED", rows_loaded, err_msg, source_count)
             except Exception:
                 pass
             try:
@@ -1261,8 +915,11 @@ class BulkTransformEngine:
         # Databricks serverless / Spark Connect — use csv.DictReader instead,
         # same approach as load_transforms(), then create the DataFrame in memory)
         rows: List[Dict[str, str]] = []
+        csv_columns: List[str] = []
         with open(csv_full_path, encoding="utf-8", newline="") as fh:
-            for raw in csv.DictReader(fh):
+            reader = csv.DictReader(fh)
+            csv_columns = [c.strip() for c in (reader.fieldnames or [])]
+            for raw in reader:
                 rows.append({k.strip(): (v.strip() if v else "") for k, v in raw.items()})
 
         if not rows:
@@ -1270,25 +927,40 @@ class BulkTransformEngine:
             return
 
         df = self.spark.createDataFrame(rows)
+        # Enforce column order to match silver_config.csv header exactly
+        if csv_columns:
+            df = df.select(csv_columns)
         target_plain = f"{cat}.{sch}.{tbl}"
 
         if self.spark.catalog.tableExists(target_plain):
-            # MERGE: update changed rows, insert new rows — preserves runtime state
-            df.createOrReplaceTempView("_config_csv_src")
-            all_cols = df.columns
-            update_set = ", ".join([f"tgt.{c} = src.{c}" for c in all_cols if c != "id"])
-            insert_cols = ", ".join(all_cols)
-            insert_vals = ", ".join([f"src.{c}" for c in all_cols])
-            self.spark.sql(
-                f"""
-                MERGE INTO {target} AS tgt
-                USING _config_csv_src AS src ON tgt.id = src.id
-                WHEN MATCHED THEN UPDATE SET {update_set}
-                WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
-                """
-            )
-            logger.info("[CONFIG] silver_config.csv → MERGED into %s (%d rows)", target_plain, len(rows))
-            print(f"[CONFIG]  silver_config.csv merged into Delta table: {target_plain} ({len(rows)} rows)")
+            existing_cols = set(self.spark.table(target_plain).columns)
+            new_cols = set(df.columns)
+            if existing_cols != new_cols:
+                # Schema changed (column added/removed/renamed) — overwrite to apply new schema.
+                # This handles config evolution (e.g. pk_columns → pk, is_processed → processed).
+                df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(target_plain)
+                logger.info(
+                    "[CONFIG] Schema change detected (old=%s, new=%s) — recreated %s (%d rows)",
+                    sorted(existing_cols), sorted(new_cols), target_plain, len(rows),
+                )
+                print(f"[CONFIG]  Schema updated — silver_config.csv recreated Delta table: {target_plain} ({len(rows)} rows)")
+            else:
+                # Same schema — MERGE to preserve runtime state (processed flag etc.)
+                df.createOrReplaceTempView("_config_csv_src")
+                all_cols = df.columns
+                update_set = ", ".join([f"tgt.{c} = src.{c}" for c in all_cols if c != "id"])
+                insert_cols = ", ".join(all_cols)
+                insert_vals = ", ".join([f"src.{c}" for c in all_cols])
+                self.spark.sql(
+                    f"""
+                    MERGE INTO {target} AS tgt
+                    USING _config_csv_src AS src ON tgt.id = src.id
+                    WHEN MATCHED THEN UPDATE SET {update_set}
+                    WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+                    """
+                )
+                logger.info("[CONFIG] silver_config.csv → MERGED into %s (%d rows)", target_plain, len(rows))
+                print(f"[CONFIG]  silver_config.csv merged into Delta table: {target_plain} ({len(rows)} rows)")
         else:
             # First run — create table with initial data
             df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(target_plain)
@@ -1311,11 +983,19 @@ class BulkTransformEngine:
             COMMENT 'Runtime state for BulkTransformEngine'
             """
         )
+        # Migrate existing tables that pre-date the source_count column.
+        try:
+            self.spark.sql(
+                f"ALTER TABLE {self.control_table} ADD COLUMN source_count LONG"
+            )
+        except Exception:
+            pass  # column already exists — safe to ignore
 
     def _bootstrap_control_row(self, transform_id: str, csv_last_load_time: str) -> None:
         exists = (
             self.spark.table(self.control_table)
             .filter(F.col("id") == transform_id)
+            .limit(1)
             .count() > 0
         )
         if exists:
@@ -1329,10 +1009,10 @@ class BulkTransformEngine:
                 logger.warning("[%s] Cannot parse last_load_time=%r", transform_id, csv_last_load_time)
 
         self.spark.createDataFrame(
-            [(transform_id, seed_ts, "BOOTSTRAPPED", datetime.utcnow(), 0, "")],
+            [(transform_id, seed_ts, "BOOTSTRAPPED", datetime.utcnow(), 0, 0, "")],
             schema=(
                 "id STRING, last_load_time TIMESTAMP, last_run_status STRING, "
-                "last_run_ts TIMESTAMP, rows_loaded LONG, error_message STRING"
+                "last_run_ts TIMESTAMP, rows_loaded LONG, source_count LONG, error_message STRING"
             ),
         ).write.format("delta").mode("append").saveAsTable(self.control_table)
         logger.info("[%s] Control table seeded — last_load_time=%s", transform_id, seed_ts)
@@ -1358,12 +1038,19 @@ class BulkTransformEngine:
             """
         )
 
-    def _update_control(self, transform_id: str, status: str, rows_loaded: int, error_message: str) -> None:
+    def _update_control(
+        self,
+        transform_id: str,
+        status: str,
+        rows_loaded: int,
+        error_message: str,
+        source_count: int = 0,
+    ) -> None:
         self.spark.createDataFrame(
-            [(transform_id, status, datetime.utcnow(), rows_loaded, error_message)],
+            [(transform_id, status, datetime.utcnow(), rows_loaded, source_count, error_message)],
             schema=(
                 "id STRING, last_run_status STRING, last_run_ts TIMESTAMP, "
-                "rows_loaded LONG, error_message STRING"
+                "rows_loaded LONG, source_count LONG, error_message STRING"
             ),
         ).createOrReplaceTempView("_bulk_ctrl_update")
         self.spark.sql(
@@ -1374,6 +1061,7 @@ class BulkTransformEngine:
                 tgt.last_run_status = src.last_run_status,
                 tgt.last_run_ts     = src.last_run_ts,
                 tgt.rows_loaded     = src.rows_loaded,
+                tgt.source_count    = src.source_count,
                 tgt.error_message   = src.error_message
             """
         )
@@ -1407,9 +1095,31 @@ class BulkTransformEngine:
         logger.warning("[%s] No query/sql_file — using SELECT * FROM source", transform["id"])
         return "SELECT * FROM source"
 
+    def _run_dq_prewrite(
+        self, tid: str, df: DataFrame, dq_config_path: str, run_id: str
+    ) -> Tuple[DataFrame, DataFrame, Dict[str, Any]]:
+        """
+        Run DQ checks on the transformed DataFrame BEFORE writing to Silver.
+        Returns (valid_df, quarantine_df, summary).
+        Only valid rows are subsequently written to the Silver table.
+        """
+        from utils.dq_engine import DQEngine
+
+        raw = self._load_yaml(dq_config_path)
+        dq_cfg = raw.get("data_quality", raw)
+        dq_engine = DQEngine(self.spark, dq_cfg)
+        valid_df, quarantine_df, summary = dq_engine.run(df, run_id=run_id)
+        logger.info(
+            "  [%s] DQ pre-write: total=%d  pass=%d  fail=%d  status=%s",
+            tid, summary["total_rows"], summary["pass_rows"],
+            summary["fail_rows"], summary["status"],
+        )
+        return valid_df, quarantine_df, summary
+
     def _run_data_quality(
         self, tid: str, full_target: str, dq_config_path: str, run_id: str
     ) -> Dict[str, Any]:
+        """Post-write DQ scan on the Silver table (used by run_dq_all / Stage 2)."""
         from utils.dq_engine import DQEngine
 
         raw = self._load_yaml(dq_config_path)
@@ -1419,7 +1129,7 @@ class BulkTransformEngine:
             self.spark.table(full_target), run_id=run_id
         )
         logger.info(
-            "  [%s] DQ: total=%d pass=%d fail=%d status=%s",
+            "  [%s] DQ post-write: total=%d pass=%d fail=%d status=%s",
             tid, summary["total_rows"], summary["pass_rows"],
             summary["fail_rows"], summary["status"],
         )
@@ -1480,7 +1190,7 @@ class BulkTransformEngine:
         status: str = "SUCCESS",
         error_message: str = "",
     ) -> None:
-        audit_table = transform.get("audit_table", "").strip() or self._DEFAULT_AUDIT_TABLE
+        audit_table = self._DEFAULT_AUDIT_TABLE
         duration = int((datetime.utcnow() - t_start).total_seconds())
         parts = full_target.split(".")
         table_name = ".".join(parts[-2:]) if len(parts) >= 2 else full_target
@@ -1540,16 +1250,9 @@ class BulkTransformEngine:
         )
         logger.info("  merge complete: %s", full_target)
 
-    def _optimize_and_vacuum(self, full_target: str, zorder_cols: List[str], vacuum_hours: int) -> None:
-        if zorder_cols:
-            self.spark.sql(f"OPTIMIZE {full_target} ZORDER BY ({', '.join(zorder_cols)})")
-            logger.info("  OPTIMIZE ZORDER BY (%s) complete", ", ".join(zorder_cols))
-        else:
-            self.spark.sql(f"OPTIMIZE {full_target}")
-            logger.info("  OPTIMIZE complete")
-        if vacuum_hours and vacuum_hours > 0:
-            self.spark.sql(f"VACUUM {full_target} RETAIN {vacuum_hours} HOURS")
-            logger.info("  VACUUM RETAIN %sh complete", vacuum_hours)
+    def _optimize_and_vacuum(self, full_target: str) -> None:
+        self.spark.sql(f"OPTIMIZE {full_target}")
+        logger.info("  OPTIMIZE complete: %s", full_target)
 
     #  Summary ─
 

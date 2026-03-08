@@ -124,16 +124,18 @@ class GovernanceEngine:
                 logger.warning("Column tag failed on '%s': %s", col, exc)
 
     def _ensure_governance_schema(self) -> None:
-        """Verify governance catalog exists and create schema if it doesn't."""
-        try:
-            existing = {r[0].lower() for r in self.spark.sql("SHOW CATALOGS").collect()}
-            if self.catalog.lower() not in existing:
-                raise RuntimeError(f"Catalog `{self.catalog}` does not exist. Please create it first.")
-            self.spark.sql(
-                f"CREATE SCHEMA IF NOT EXISTS `{self.catalog}`.`governance`"
+        """
+        Verify the governance catalog exists, then create the governance schema
+        if it doesn't.  Raises RuntimeError if the catalog is missing so that
+        callers fail loudly instead of silently skipping PII masking.
+        """
+        existing = {r[0].lower() for r in self.spark.sql("SHOW CATALOGS").collect()}
+        if self.catalog.lower() not in existing:
+            raise RuntimeError(
+                f"Catalog `{self.catalog}` does not exist. "
+                f"Please create it in the Databricks UI before running governance."
             )
-        except Exception as exc:
-            logger.warning("Could not ensure governance schema: %s", exc)
+        self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{self.catalog}`.`governance`")
 
     def apply_column_masking(self) -> None:
         self._ensure_governance_schema()

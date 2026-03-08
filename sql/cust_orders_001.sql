@@ -1,8 +1,5 @@
 SELECT
-    c.customerID    AS customer_id,
-    c.first_name,
-    o.order_total,
-    a.region,
+    c.customerID AS customer_id,
     t.*
 FROM samples.bakehouse.sales_customers c
 left join samples.bakehouse.sales_transactions t on t.customerID = c.customerID

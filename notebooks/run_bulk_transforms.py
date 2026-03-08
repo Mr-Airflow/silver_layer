@@ -2,16 +2,20 @@
 
 # notebooks/run_bulk_transforms.py — Bulk Transform Orchestrator
 #
-# Reads config/silver_config.csv and runs every enabled transform row
-# through the BulkTransformEngine (incremental watermark → SQL → Silver write
-# → OPTIMIZE → VACUUM → watermark update → transformation log).
+# Single-notebook entry point that runs the full Silver pipeline in one shot.
+# Internally delegates to the same staged methods used by notebooks/stages/00–05,
+# so both execution paths share one code base and one set of behaviours:
+#
+#   run_all()  →  validate_all()       Stage 0: infra + source checks
+#              →  transform_all()      Stage 1: Bronze → DQ pre-write → Silver
+#              →  run_governance_all() Stage 2 (governance)
+#              →  run_optimize_all()   Stage 3
+#              →  run_audit_all()      Stage 4
+#              →  mark_processed()     Stage 5
 #
 # All configuration is driven by:
 #   config/parameter.yml     — catalog/schema/table locations
-#   config/silver_config.csv — per-table transform definitions (loaded as Delta)
-#
-# Load type (full_refresh / incremental) is controlled per-row via the
-# load_type column in silver_config.csv.
+#   config/silver_config.csv — per-table transform definitions
 
 # COMMAND ----------
 
@@ -22,9 +26,6 @@ import logging
 # Configuration — all values sourced from parameter.yml / silver_config.csv
 # ---------------------------------------------------------------------------
 
-# Derive project root from the notebook's own deployed workspace path.
-# DAB deploys files to /Workspace/Users/<user>/<bundle>/...
-# Splitting on "/notebooks" gives us the bundle root regardless of target/env.
 _nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
 CONFIG_BASE_PATH    = "/Workspace" + _nb_path.split("/notebooks")[0]
 
@@ -67,6 +68,7 @@ engine = BulkTransformEngine(
 # COMMAND ----------
 
 #  Dry-run: load and display the plan without executing
+#  (reads from CSV directly for plan display — Delta table is written by run_all → validate_all)
 
 transforms = engine.load_transforms(filter_ids=FILTER_IDS)
 
@@ -96,7 +98,8 @@ if DRY_RUN:
 
 # COMMAND ----------
 
-#  Execute all transforms
+#  Execute all transforms via run_all() which calls validate_all() first,
+#  then runs every stage in order using the same code path as notebooks/stages/.
 
 results = engine.run_all(
     filter_ids    = FILTER_IDS,
@@ -107,11 +110,11 @@ results = engine.run_all(
 
 #  Publish outcome to task values (for downstream audit/monitoring)
 
-total        = len(results)
-success      = sum(1 for r in results if r.status == "SUCCESS")
-skipped      = sum(1 for r in results if r.status == "SKIPPED")
-failed       = sum(1 for r in results if r.status == "FAILED")
-total_rows   = sum(r.rows_loaded for r in results if r.status == "SUCCESS")
+total      = len(results)
+success    = sum(1 for r in results if r.status == "SUCCESS")
+skipped    = sum(1 for r in results if r.status == "SKIPPED")
+failed     = sum(1 for r in results if r.status == "FAILED")
+total_rows = sum(r.rows_loaded for r in results if r.status == "SUCCESS")
 
 dbutils.jobs.taskValues.set(key="bulk_transform_total",   value=total)
 dbutils.jobs.taskValues.set(key="bulk_transform_success", value=success)

@@ -17,7 +17,7 @@ watermark_table: watermark_state
 data_quality_catalog: cdl_silver
 data_quality_schema: data_quality
 data_quality_table: dq_log_silver
-dqx_rules_workspace_path: /Workspace/Users/praveen.yadav@aidetic.in/dqx_rules
+dqx_rules_workspace_path: /Workspace/Users/praveenfaa@gmail.com/dqx_rules
 
 #  Governance catalog / schema ─
 governance_catalog: cdl_silver

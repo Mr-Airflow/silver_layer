@@ -3,7 +3,7 @@
 governance:
 
   table_owner:  "data_engineering_team"
-  data_steward: "praveen.yadav@aidetic.in"
+  data_steward: "praveenfaa@gmail.com"
 
   table_tags:
     domain:              "retail_franchises"
@@ -15,40 +15,6 @@ governance:
     source_system:       "bakehouse"
     env:                 "prod"
 
-  pii_columns: []
-
-  column_tags:
-
-    - column: "franchiseID"
-      tags:
-        sensitivity: "internal"
-        domain:      "retail_franchises"
-        is_pk:       "true"
-
-    - column: "name"
-      tags:
-        sensitivity: "internal"
-        domain:      "retail_franchises"
-
-    - column: "country"
-      tags:
-        sensitivity: "internal"
-        domain:      "retail_franchises"
-
-    - column: "_silver_loaded_at"
-      tags:
-        system_generated: "true"
-        layer:            "silver"
-
-  grants:
-    - principal:   "data_analysts"
-      privileges:  ["SELECT"]
-      principal_type: "group"
-
-    - principal:   "data_engineering_team"
-      privileges:  ["SELECT", "MODIFY"]
-      principal_type: "group"
-
-  audit:
-    enabled:     true
-    audit_table: "cdl_silver.logging.silver_audit_log"
+audit:
+  enabled: true
+  audit_table: "cdl_silver.logging.silver_audit_log"

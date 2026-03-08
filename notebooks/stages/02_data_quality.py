@@ -1,12 +1,23 @@
 # Databricks notebook source
 
-# notebooks/stages/02_data_quality.py — Stage 2: Data Quality
-
-# Runs a DQX post-write scan for every row in the config Delta table where
-# run_data_quality=true and dq_config_path is set.
+# notebooks/stages/02_data_quality.py — Stage 2: Data Quality (post-write validation)
 #
-# DQ rules are sourced from:
-#   config/data_quality.yml  — DQX rule definitions per table
+# WHEN it runs and WHY two DQ passes exist:
+#
+#   Pass 1 — Pre-write (Stage 1, inside transform_all):
+#     DQEngine.run() is called on the *transformed* DataFrame BEFORE writing
+#     to Silver.  Rows that fail "error"-level checks are diverted to the
+#     per-table quarantine table.  Only the validated (valid_df) rows reach
+#     the Silver table.  This is the primary data-quality gate.
+#
+#   Pass 2 — Post-write (this notebook):
+#     A second scan runs against the Silver table AFTER the write.  This
+#     validates the final persisted state — catching any anomalies introduced
+#     by the merge/write process itself (schema drift, type coercion side-
+#     effects, etc.) and provides a reconciliation checkpoint for auditors.
+#
+# DQ rules are sourced per-table from the dq_config_path column in
+# silver_config.csv (e.g. config/dq/cust_001.yml).
 
 
 # COMMAND ----------
@@ -37,7 +48,7 @@ from utils.transform_engine import BulkTransformEngine
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-print(f"[DQ] run_id={run_id}")
+print(f"[DQ] run_id={run_id}  (post-write Silver validation)")
 
 engine = BulkTransformEngine(
     spark,
@@ -46,7 +57,7 @@ engine = BulkTransformEngine(
 )
 
 # COMMAND ----------
-#  Run DQ for all applicable rows
+#  Run post-write DQ scan for all applicable rows
 
 dq_stats = engine.run_dq_all(filter_ids=FILTER_IDS)
 
@@ -58,7 +69,7 @@ dbutils.jobs.taskValues.set(key="dq_fail_count",     value=dq_stats["fail_rows"]
 dbutils.jobs.taskValues.set(key="dq_tables_checked", value=dq_stats["tables_checked"])
 
 print(
-    f"\n[DQ]  Data quality stage complete — "
+    f"\n[DQ]  Post-write validation complete — "
     f"pass={dq_stats['pass_rows']:,}  fail={dq_stats['fail_rows']:,}  "
     f"tables={dq_stats['tables_checked']}"
 )

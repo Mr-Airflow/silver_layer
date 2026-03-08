@@ -2,8 +2,8 @@
 # Compute: Serverless (no cluster to manage)
 
 # ONBOARD A NEW SILVER TABLE — no code or YAML changes needed:
-#   1. Add a row to config/bulk_transforms.csv
-#   2. Optionally create per-table data_quality.yml + data_governance.yml
+#   1. Add a row to config/silver_config.csv
+#   2. Optionally create per-table config/dq/<id>.yml + config/governance/<id>.yml
 #   3. The next scheduled run picks it up automatically
 
 bundle:
@@ -21,7 +21,7 @@ variables:
 
   notification_email:
     description: "Email address for pipeline failure alerts."
-    default: "praveen.yadav@aidetic.in"
+    default: "praveenfaa@gmail.com"
 
 # TARGETS
 targets:
@@ -30,14 +30,14 @@ targets:
     mode: development          
     default: true
     workspace:
-      host: https://adb-7405618144348512.12.azuredatabricks.net/
+      host: https://dbc-4c300e18-38fe.cloud.databricks.com/
 
   staging:
     mode: development
     workspace:
-      host: https://adb-7405618144348512.12.azuredatabricks.net/
+      host: https://dbc-4c300e18-38fe.cloud.databricks.com/
 
   prod:
     mode: production           
     workspace:
-      host: https://adb-7405618144348512.12.azuredatabricks.net/
+      host: https://dbc-4c300e18-38fe.cloud.databricks.com/
